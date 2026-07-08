@@ -45,6 +45,15 @@ on every push — grab them from the **Actions** tab. macOS ships as **two nativ
 builds**: `msxforge-macos-x86_64` (Intel) and `msxforge-macos-arm64` (Apple
 Silicon). The others are `msxforge-linux` and `msxforge-windows`.
 
+On macOS the downloaded app is unsigned, so if Gatekeeper refuses to open it,
+clear the quarantine flag first:
+
+```sh
+chmod +x msxforge*
+xattr -cr msxforge-gui        # (also msxforge, dsk2dmk)
+./msxforge-gui
+```
+
 **Linux / macOS** — needs a C++17 compiler, CMake and SDL2:
 
 ```sh
