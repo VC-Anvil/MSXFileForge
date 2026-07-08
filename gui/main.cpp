@@ -867,6 +867,9 @@ int main(int argc, char** argv) {
     // Optional one-shot screenshot mode (for the README): MSXFF_SHOT=<png path>.
     const char* shotPath = getenv("MSXFF_SHOT");
     const char* shotTab = getenv("MSXFF_TAB");
+    const char* shotName = getenv("MSXFF_NAME"); // display name for the path bar
+    if (shotPath && shotName) { strncpy(app.pathInput, shotName, sizeof(app.pathInput)-1);
+        app.pathInput[sizeof(app.pathInput)-1] = 0; }
     g_forceRawTab = shotTab && strstr(shotTab, "raw");
     int frame = 0; const int shotAt = 45;
     if (shotPath && !g_forceRawTab && app.mode == Mode::Disk && app.fsMounted) {
