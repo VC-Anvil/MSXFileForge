@@ -5,7 +5,8 @@
 
 A native (C++/Dear ImGui) editor and inspector for **MSX** files, with first-class
 support for reading **protected** and **RAW** disk images that a plain `.dsk`
-cannot represent. Runs on **Windows, Linux and macOS**.
+cannot represent. Runs on **Windows, Linux and macOS** (both Intel x86_64 and
+Apple Silicon arm64).
 
 ![Editing a tokenized BASIC file straight off an MSX disk](assets/screenshot.png)
 
@@ -39,9 +40,10 @@ libs/     vendored Dear ImGui 1.92.7 + SDL2 (self-contained)
 
 ## Build
 
-Cross-platform (Windows / Linux / macOS). Pre-built binaries for all three are
-produced by CI on every push — grab them from the **Actions** tab (artifacts
-`msxforge-linux` / `msxforge-macos` / `msxforge-windows`).
+Cross-platform (Windows / Linux / macOS). Pre-built binaries are produced by CI
+on every push — grab them from the **Actions** tab. macOS ships as **two native
+builds**: `msxforge-macos-x86_64` (Intel) and `msxforge-macos-arm64` (Apple
+Silicon). The others are `msxforge-linux` and `msxforge-windows`.
 
 **Linux / macOS** — needs a C++17 compiler, CMake and SDL2:
 
