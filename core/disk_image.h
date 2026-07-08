@@ -68,8 +68,9 @@ public:
     void clearDirty() { dirty_ = false; }
     void markDirty() { dirty_ = true; }
 
-    // Mutable container bytes (for the raw hex editor). Marks dirty.
-    std::vector<uint8_t>& rawMut() { dirty_ = true; return raw_; }
+    // Mutable container bytes (for the raw hex editor). Does NOT mark dirty by
+    // itself - callers that actually change bytes should call markDirty().
+    std::vector<uint8_t>& rawMut() { return raw_; }
 
     // Physical sector table (for the protected/RAW inspector).
     const std::vector<SectorInfo>& sectors() const { return sectors_; }

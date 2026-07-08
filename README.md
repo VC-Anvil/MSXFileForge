@@ -4,6 +4,14 @@ A native (C++/Dear ImGui) editor and inspector for **MSX** files, with first-cla
 support for reading **protected** and **RAW** disk images that a plain `.dsk`
 cannot represent.
 
+![Editing a tokenized BASIC file straight off an MSX disk](assets/screenshot.png)
+
+Many games catalogue only 1-2 files while the rest of the disk is uncatalogued
+**RAW** sector data (read directly by a custom loader — not encryption). The
+RAW browser makes it visible, exportable, re-importable and carvable:
+
+![RAW data / cluster map of a Fray disk](assets/screenshot-raw.png)
+
 It handles the whole MSX file stack:
 
 | Domain | What it does |

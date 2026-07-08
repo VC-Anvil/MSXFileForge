@@ -22,6 +22,8 @@
 #include "imgui.h"
 #include "backends/imgui_impl_sdl2.h"
 #include "backends/imgui_impl_opengl3.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "../libs/stb_image_write.h"
 
 #include "../core/disk_image.h"
 #include "../core/fat12.h"
@@ -103,6 +105,21 @@ static bool hasExt(const std::string& p, const char* e) {
     return t == e;
 }
 static void openUrl(const char* url) { ShellExecuteA(nullptr, "open", url, nullptr, nullptr, SW_SHOWNORMAL); }
+
+// Capture the GL framebuffer to a PNG (used for the README screenshot). Done
+// from inside the GL context, so it is immune to the black-frame problem GDI
+// screen grabs hit over OpenGL/MPO windows.
+static void saveScreenshot(SDL_Window* win, const char* path) {
+    int w = 0, h = 0; SDL_GL_GetDrawableSize(win, &w, &h);
+    if (w <= 0 || h <= 0) return;
+    std::vector<uint8_t> px((size_t)w * h * 4);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    std::vector<uint8_t> flip((size_t)w * h * 4);          // OpenGL is bottom-up
+    for (int y = 0; y < h; ++y)
+        memcpy(&flip[(size_t)(h - 1 - y) * w * 4], &px[(size_t)y * w * 4], (size_t)w * 4);
+    stbi_write_png(path, w, h, 4, flip.data(), w * 4);
+}
 
 static std::string openDialog(HWND owner, const char* filter) {
     char file[1024] = "";
@@ -260,6 +277,7 @@ static void applyTheme() {
     c[ImGuiCol_TextDisabled]    = ImVec4(0.52f,0.56f,0.62f,1.0f);
 }
 
+static bool g_forceRawTab = false; // screenshot mode: open the RAW data/map tab
 static const ImVec4 kAccent(0.42f,0.80f,1.0f,1.0f);
 static const ImVec4 kDir(0.98f,0.80f,0.35f,1.0f);
 static const ImVec4 kWarn(1.0f,0.62f,0.25f,1.0f);
@@ -637,11 +655,13 @@ static void drawPreview(App& a) {
         if (ImGui::BeginTabItem("Raw image")) {
             ImGui::TextDisabled("Whole container (%zu bytes). Editable; touches the image directly.",
                                 a.disk.raw().size());
-            static bool dummy = false;
-            drawHexEditor(a, a.disk.rawMut(), a.disk.raw(), true, "rawhex", &dummy);
+            bool edited = false;
+            drawHexEditor(a, a.disk.rawMut(), a.disk.raw(), true, "rawhex", &edited);
+            if (edited) a.disk.markDirty();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("RAW data / map")) {
+        if (ImGui::BeginTabItem("RAW data / map", nullptr,
+                                g_forceRawTab ? ImGuiTabItemFlags_SetSelected : 0)) {
             drawRawMap(a);
             ImGui::EndTabItem();
         }
@@ -844,6 +864,22 @@ int main(int argc, char** argv) {
     if (SDL_GetWindowWMInfo(win, &wm)) app.hwnd = wm.info.win.window;
     if (argc > 1 && argv[1][0]) openPath(app, argv[1]);
 
+    // Optional one-shot screenshot mode (for the README): MSXFF_SHOT=<png path>.
+    const char* shotPath = getenv("MSXFF_SHOT");
+    const char* shotTab = getenv("MSXFF_TAB");
+    g_forceRawTab = shotTab && strstr(shotTab, "raw");
+    int frame = 0; const int shotAt = 45;
+    if (shotPath && !g_forceRawTab && app.mode == Mode::Disk && app.fsMounted) {
+        int pick = -1;
+        for (int i = 0; i < (int)app.listing.size(); ++i) {
+            const DirEntry& e = app.listing[i];
+            if (e.isDir() || e.isVolume()) continue;
+            if (pick < 0) pick = i;
+            if (e.name.size() >= 4 && e.name.substr(e.name.size()-4) == ".BAS") { pick = i; break; }
+        }
+        if (pick >= 0) selectFile(app, pick);
+    }
+
     bool running = true;
     while (running) {
         SDL_Event ev;
@@ -971,6 +1007,7 @@ int main(int argc, char** argv) {
         glClearColor(0.07f, 0.08f, 0.10f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        if (shotPath && ++frame >= shotAt) { saveScreenshot(win, shotPath); running = false; }
         SDL_GL_SwapWindow(win);
     }
 
