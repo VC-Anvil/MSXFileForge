@@ -349,6 +349,82 @@ static int textResize(ImGuiInputTextCallbackData* data) {
     return 0;
 }
 
+// ---- RAW / cluster map ----------------------------------------------------
+static void drawRawMap(App& a) {
+    if (!a.fsMounted) {
+        ImGui::TextDisabled("No FAT12 filesystem - the whole container is raw. Use the 'Raw image' tab.");
+        return;
+    }
+    auto map = a.fs.clusterMap();
+    long cb = (long)a.fs.sectorsPerCluster() * 512;
+    long freeN = 0, named = 0, raw = 0;
+    for (auto s : map) { if (s == Fat12::CL_FREE) freeN++; else if (s == Fat12::CL_NAMED) named++; else raw++; }
+
+    ImGui::TextWrapped("Some MSX games (Fray, Xak, ...) store most of their data in RAW sectors that are "
+        "allocated but have NO directory entry - a custom loader reads them by sector, not by name. "
+        "This is NOT encryption: the data below is fully readable. Named files appear in the tree; the "
+        "RAW region is shown here and can be exported.");
+    ImGui::Spacing();
+    ImGui::Text("Named files:"); ImGui::SameLine(); ImGui::TextColored(kGreen, "%ld KB", named*cb/1024);
+    ImGui::SameLine(); ImGui::Text("   RAW unnamed:"); ImGui::SameLine();
+    ImGui::TextColored(kWarn, "%ld KB", raw*cb/1024);
+    ImGui::SameLine(); ImGui::Text("   Free:"); ImGui::SameLine();
+    ImGui::TextDisabled("%ld KB", freeN*cb/1024);
+
+    if (ImGui::Button("Export RAW data (unnamed) to file...")) {
+        auto d = a.fs.extractRawUnnamed();
+        std::string p = saveDialog(a.hwnd, "Binary\0*.bin\0All files\0*.*\0", "bin", "raw_data.bin");
+        if (!p.empty()) { dump(p, d.data(), d.size());
+            a.status = "Exported " + std::to_string(d.size()) + " bytes of RAW data -> " + p; }
+    }
+    help("Concatenate every allocated-but-unnamed cluster (the uncatalogued game data) and save it to your PC.");
+    ImGui::SameLine();
+    if (ImGui::Button("Export whole image...")) {
+        std::string p = saveDialog(a.hwnd, "All files\0*.*\0", "", a.imagePath.c_str());
+        if (!p.empty()) { dump(p, a.disk.raw().data(), a.disk.raw().size());
+            a.status = "Exported whole image -> " + p; }
+    }
+    ImGui::Separator();
+
+    // Legend
+    ImGui::ColorButton("##g", ImVec4(0.30f,0.70f,0.35f,1), ImGuiColorEditFlags_NoTooltip, ImVec2(14,14));
+    ImGui::SameLine(); ImGui::TextUnformatted("named"); ImGui::SameLine(0, 18);
+    ImGui::ColorButton("##o", ImVec4(0.95f,0.60f,0.20f,1), ImGuiColorEditFlags_NoTooltip, ImVec2(14,14));
+    ImGui::SameLine(); ImGui::TextUnformatted("RAW (unnamed)"); ImGui::SameLine(0, 18);
+    ImGui::ColorButton("##f", ImVec4(0.22f,0.24f,0.28f,1), ImGuiColorEditFlags_NoTooltip, ImVec2(14,14));
+    ImGui::SameLine(); ImGui::TextUnformatted("free");
+
+    // Heatmap
+    int n = (int)map.size();
+    const int cols = 48; const float cell = 12.0f, pad = 1.5f;
+    int rows = (n + cols - 1) / cols;
+    ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImGui::InvisibleButton("map", ImVec2(cols * cell, rows * cell));
+    for (int i = 0; i < n; ++i) {
+        int r = i / cols, c = i % cols;
+        ImVec2 p0(origin.x + c * cell, origin.y + r * cell);
+        ImVec2 p1(p0.x + cell - pad, p0.y + cell - pad);
+        ImU32 col = map[i] == Fat12::CL_NAMED ? IM_COL32(76,178,89,255)
+                  : map[i] == Fat12::CL_RAW   ? IM_COL32(242,153,51,255)
+                                              : IM_COL32(56,61,71,255);
+        dl->AddRectFilled(p0, p1, col, 2.0f);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImVec2 m = ImGui::GetMousePos();
+        int c = (int)((m.x - origin.x) / cell), r = (int)((m.y - origin.y) / cell);
+        int idx = r * cols + c;
+        if (c >= 0 && c < cols && idx >= 0 && idx < n) {
+            const char* st = map[idx] == Fat12::CL_NAMED ? "named file"
+                           : map[idx] == Fat12::CL_RAW ? "RAW (unnamed)" : "free";
+            ImGui::BeginTooltip();
+            ImGui::Text("cluster %d  (%s)", idx + 2, st);
+            ImGui::Text("image offset 0x%06lX", a.fs.clusterByteOffset(idx + 2));
+            ImGui::EndTooltip();
+        }
+    }
+}
+
 // ---- Panels ---------------------------------------------------------------
 static void drawFileTree(App& a) {
     if (ImGui::Checkbox("Show deleted", &a.showDeleted)) refreshListing(a);
@@ -488,6 +564,10 @@ static void drawPreview(App& a) {
             drawHexEditor(a, a.disk.rawMut(), a.disk.raw(), true, "rawhex", &dummy);
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("RAW data / map")) {
+            drawRawMap(a);
+            ImGui::EndTabItem();
+        }
         if (ImGui::BeginTabItem("Protection / sectors")) {
             ImGui::Text("Physical sectors: %zu", a.disk.sectors().size());
             ImGui::SameLine();
@@ -594,9 +674,12 @@ static void drawManual(App& a) {
           "Save image as (Ctrl+Shift+S). The status bar shows when the image has unsaved changes.");
 
         H("Protected / RAW disks");
-        P("Open a .dmk and use the 'Protection / sectors' tab to see the real physical sector layout: "
-          "non-standard sizes, deleted-data marks and CRC anomalies are flagged in orange. The normal "
-          "FAT12 filesystem is still reconstructed from the standard sectors where possible.");
+        P("Some games show only 1-2 files in the tree but the disk is nearly full. The bulk is RAW data: "
+          "sectors that are allocated but have NO directory entry, read directly by the game's loader. "
+          "This is NOT encryption - the data is fully readable. Open the 'RAW data / map' tab to see a "
+          "colour map (green = named, orange = RAW, grey = free) and to Export the RAW region to your PC.\n"
+          "For .dmk track images, the 'Protection / sectors' tab shows the physical sector layout: "
+          "non-standard sizes, deleted-data marks and CRC anomalies are flagged in orange.");
 
         H("ROM / CAS");
         P("ROMs show size, page count, the AB header entry points and a detected mapper "
@@ -611,12 +694,16 @@ static void drawAbout(App& a) {
     if (!a.showAbout) return;
     ImGui::SetNextWindowSize(ImVec2(420, 220), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("About MSXFileForge", &a.showAbout)) {
-        ImGui::TextColored(kAccent, "MSXFileForge  v0.2");
+        ImGui::TextColored(kAccent, "MSXFileForge  v0.3");
         ImGui::TextWrapped("A native editor/inspector for MSX disk images, files, ROMs and tapes, "
-                           "with protected/RAW (.dmk) support.");
+                           "with protected/RAW (.dmk) support and a raw-sector browser.");
         ImGui::Separator();
-        ImGui::TextDisabled("Dear ImGui + SDL2 + OpenGL3. FAT12 read/write, BASIC (de)tokenizer, "
-                            "ROM mapper detection, cassette parser.");
+        ImGui::Text("Author:  Alonso  (GitHub: GS-RUN)");
+        ImGui::Text("Built with Claude Code (Opus 4.8).");
+        ImGui::Text("License: see repository.");
+        ImGui::Spacing();
+        ImGui::TextDisabled("Bundles Dear ImGui (MIT) and SDL2 (zlib).");
+        ImGui::TextDisabled("FAT12 read/write, BASIC (de)tokenizer, ROM mapper detection, cassette parser.");
     }
     ImGui::End();
 }

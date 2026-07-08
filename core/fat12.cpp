@@ -369,4 +369,53 @@ bool Fat12::deleteFile(const DirEntry& e, std::string* err) {
     return true;
 }
 
+// ---- RAW / uncatalogued data ----------------------------------------------
+
+long Fat12::clusterByteOffset(int cluster) const {
+    return (dataStartSec_ + (long)(cluster - 2) * spc_) * 512;
+}
+
+void Fat12::collectNamedClusters(int cluster, std::vector<uint8_t>& status, bool isRoot) const {
+    std::vector<DirEntry> entries = isRoot ? readRootDir(false) : readDirAtCluster(cluster, false);
+    for (auto& e : entries) {
+        if (e.name == "." || e.name == ".." || e.deleted) continue; // deleted stay "raw"
+        if (e.isVolume()) continue;
+        for (int c : chainOf(e.startCluster)) {
+            int idx = c - 2;
+            if (idx >= 0 && idx < (int)status.size()) status[idx] = CL_NAMED;
+        }
+        if (e.isDir() && e.startCluster >= 2) collectNamedClusters(e.startCluster, status, false);
+    }
+}
+
+std::vector<uint8_t> Fat12::clusterMap() const {
+    std::vector<uint8_t> st(totalClusters_ > 0 ? totalClusters_ : 0, CL_FREE);
+    if (!mounted_) return st;
+    for (int c = 2; c < totalClusters_ + 2; ++c) {
+        int idx = c - 2;
+        if (idx < 0 || idx >= (int)st.size()) continue;
+        if (fatEntry(c) != 0) st[idx] = CL_RAW; // allocated; refined below
+    }
+    collectNamedClusters(0, st, true);
+    return st;
+}
+
+std::vector<uint8_t> Fat12::extractRawUnnamed() const {
+    std::vector<uint8_t> out;
+    if (!mounted_) return out;
+    auto st = clusterMap();
+    long clusterBytes = (long)spc_ * 512;
+    for (int i = 0; i < (int)st.size(); ++i) {
+        if (st[i] != CL_RAW) continue;
+        int cluster = i + 2;
+        long firstSec = dataStartSec_ + (long)(cluster - 2) * spc_;
+        for (int s = 0; s < spc_; ++s) {
+            uint8_t sec[512];
+            if (disk_->readSector(firstSec + s, sec)) out.insert(out.end(), sec, sec + 512);
+        }
+        (void)clusterBytes;
+    }
+    return out;
+}
+
 } // namespace msx

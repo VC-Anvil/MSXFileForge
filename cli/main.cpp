@@ -215,6 +215,28 @@ static int cmd_tok(int argc, char** argv) {
     return 0;
 }
 
+static int cmd_raw(int argc, char** argv) {
+    // raw <image> [out.bin]  -> report cluster map + optionally dump RAW data
+    if (argc < 3) { fprintf(stderr, "need <image> [out.bin]\n"); return 1; }
+    DiskImage dk; Fat12 fs;
+    int rc = mountDisk(argv[2], dk, fs); if (rc) return rc;
+    auto map = fs.clusterMap();
+    long cb = (long)fs.sectorsPerCluster() * 512;
+    long freeN = 0, named = 0, raw = 0;
+    for (auto s : map) { if (s == 0) freeN++; else if (s == 1) named++; else raw++; }
+    printf("Data clusters : %zu  (%ld bytes each)\n", map.size(), cb);
+    printf("  named files : %ld  (%ld KB)\n", named, named*cb/1024);
+    printf("  RAW unnamed : %ld  (%ld KB)  <-- uncatalogued game data\n", raw, raw*cb/1024);
+    printf("  free        : %ld  (%ld KB)\n", freeN, freeN*cb/1024);
+    if (argc >= 4) {
+        auto data = fs.extractRawUnnamed();
+        FILE* o = fopen(argv[3], "wb");
+        if (o) { fwrite(data.data(),1,data.size(),o); fclose(o);
+            printf("Extracted RAW data: %zu bytes -> %s\n", data.size(), argv[3]); }
+    }
+    return 0;
+}
+
 static int cmd_rominfo(const char* path) {
     auto d = slurp(path);
     if (d.empty()) { fprintf(stderr, "cannot read %s\n", path); return 2; }
@@ -260,6 +282,7 @@ int main(int argc, char** argv) {
     if (cmd == "put")     return cmd_put(argc, argv);
     if (cmd == "del")     return cmd_del(argc, argv);
     if (cmd == "tok")     return cmd_tok(argc, argv);
+    if (cmd == "raw")     return cmd_raw(argc, argv);
     if (cmd == "rominfo") return cmd_rominfo(argv[2]);
     if (cmd == "cas")     return cmd_cas(argv[2]);
     fprintf(stderr, "unknown command: %s\n", cmd.c_str());

@@ -65,7 +65,27 @@ public:
     // Mark a file deleted (0xE5) and free its clusters. Re-list afterwards.
     bool deleteFile(const DirEntry& e, std::string* err = nullptr);
 
+    // ---- RAW / uncatalogued data ----
+    // Many MSX games (Fray, Xak, ...) store their bulk data in raw sectors that
+    // are marked allocated in the FAT but have NO directory entry - a custom
+    // loader reads them by sector, not by name. This is NOT encryption.
+    // clusterMap() returns one status per data cluster (cluster n -> index n-2):
+    //   0 = free, 1 = belongs to a named file/dir, 2 = allocated but unnamed (RAW).
+    enum { CL_FREE = 0, CL_NAMED = 1, CL_RAW = 2 };
+    std::vector<uint8_t> clusterMap() const;
+
+    // Concatenate every allocated-but-unnamed cluster's bytes, in cluster order.
+    // This is the raw game payload the loader consumes.
+    std::vector<uint8_t> extractRawUnnamed() const;
+
+    // Byte offset in the image where a data cluster begins (for the raw viewer).
+    long clusterByteOffset(int cluster) const;
+
+    int firstDataCluster() const { return 2; }
+    int dataClusterCount() const { return totalClusters_; }
+
 private:
+    void collectNamedClusters(int cluster, std::vector<uint8_t>& status, bool isRoot) const;
     bool writeByteAt(long imageOffset, uint8_t value);
     bool readByteAt(long imageOffset, uint8_t& out) const;
     void setFatEntry(int cluster, int value);   // writes all FAT copies
