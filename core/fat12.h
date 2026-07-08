@@ -78,6 +78,16 @@ public:
     // This is the raw game payload the loader consumes.
     std::vector<uint8_t> extractRawUnnamed() const;
 
+    // Inverse of extractRawUnnamed: write `data` back across the RAW (allocated-
+    // but-unnamed) clusters, in the same order. Exact round-trip for same-size
+    // data. If data exceeds the RAW capacity it is truncated (err set, returns
+    // false); *written receives the bytes actually stored.
+    bool writeRawUnnamed(const std::vector<uint8_t>& data, long* written = nullptr,
+                         std::string* err = nullptr);
+
+    // Total bytes available in the RAW region (allocated-but-unnamed clusters).
+    long rawUnnamedCapacity() const;
+
     // Byte offset in the image where a data cluster begins (for the raw viewer).
     long clusterByteOffset(int cluster) const;
 

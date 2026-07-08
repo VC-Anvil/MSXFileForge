@@ -404,7 +404,6 @@ std::vector<uint8_t> Fat12::extractRawUnnamed() const {
     std::vector<uint8_t> out;
     if (!mounted_) return out;
     auto st = clusterMap();
-    long clusterBytes = (long)spc_ * 512;
     for (int i = 0; i < (int)st.size(); ++i) {
         if (st[i] != CL_RAW) continue;
         int cluster = i + 2;
@@ -413,9 +412,39 @@ std::vector<uint8_t> Fat12::extractRawUnnamed() const {
             uint8_t sec[512];
             if (disk_->readSector(firstSec + s, sec)) out.insert(out.end(), sec, sec + 512);
         }
-        (void)clusterBytes;
     }
     return out;
+}
+
+long Fat12::rawUnnamedCapacity() const {
+    if (!mounted_) return 0;
+    auto st = clusterMap();
+    long raw = 0;
+    for (auto s : st) if (s == CL_RAW) raw++;
+    return raw * (long)spc_ * 512;
+}
+
+bool Fat12::writeRawUnnamed(const std::vector<uint8_t>& data, long* written, std::string* err) {
+    if (written) *written = 0;
+    if (!mounted_) { if (err) *err = "not mounted"; return false; }
+    auto st = clusterMap();
+    long pos = 0, total = (long)data.size();
+    for (int i = 0; i < (int)st.size() && pos < total; ++i) {
+        if (st[i] != CL_RAW) continue;
+        int cluster = i + 2;
+        long firstSec = dataStartSec_ + (long)(cluster - 2) * spc_;
+        for (int s = 0; s < spc_ && pos < total; ++s) {
+            uint8_t sec[512];
+            if (!disk_->readSector(firstSec + s, sec)) { if (err) *err = "read error"; return false; }
+            long chunk = total - pos; if (chunk > 512) chunk = 512;
+            memcpy(sec, data.data() + pos, (size_t)chunk); // partial tail keeps old bytes
+            if (!disk_->writeLogicalSector(firstSec + s, sec)) { if (err) *err = "write error"; return false; }
+            pos += chunk;
+        }
+    }
+    if (written) *written = pos;
+    if (pos < total) { if (err) *err = "data larger than RAW capacity; truncated"; return false; }
+    return true;
 }
 
 } // namespace msx

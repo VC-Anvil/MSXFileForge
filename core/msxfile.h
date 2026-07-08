@@ -34,4 +34,20 @@ std::string detokenizeBasic(const std::vector<uint8_t>& d);
 // designed so detokenizeBasic(tokenizeBasic(t)) reproduces t.
 std::vector<uint8_t> tokenizeBasic(const std::string& text);
 
+// ---- Block carving --------------------------------------------------------
+// Split a raw byte blob (e.g. the RAW region of a loader disk) into recognizable
+// segments: BLOAD images (0xFE header), tokenized BASIC programs (0xFF), and the
+// unrecognized gaps between them. Headers are only accepted at sector (512)
+// boundaries or immediately after a previous block, which keeps false positives
+// low on real loader data.
+enum class CarveType { Bload, BasicTokenized, Unknown };
+const char* carveTypeName(CarveType t);
+struct CarvedBlock {
+    long offset = 0;
+    long length = 0;
+    CarveType type = CarveType::Unknown;
+    uint16_t start = 0, end = 0, exec = 0; // for BLOAD
+};
+std::vector<CarvedBlock> carveBlocks(const std::vector<uint8_t>& d);
+
 } // namespace msx

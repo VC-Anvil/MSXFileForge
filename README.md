@@ -9,7 +9,7 @@ It handles the whole MSX file stack:
 | Domain | What it does |
 |--------|--------------|
 | **Disk images** | `.dsk` / raw sector dumps, and `.dmk` track images (protected disks). Auto-detects geometry (SS/DS, 360/720 KB). |
-| **Protected / RAW** | A `.dmk` preserves the physical IDAM/sector layout, so copy-protected disks survive: non-standard sector sizes, deleted-data address marks, duplicate IDs and CRC anomalies are surfaced in a **sector inspector**. Many games (Fray, Xak, ...) show only 1-2 catalogued files while the rest of the disk is **RAW uncatalogued sector data** read directly by a custom loader (not encryption); a **cluster map + RAW extractor** makes that data visible and exportable. |
+| **Protected / RAW** | A `.dmk` preserves the physical IDAM/sector layout, so copy-protected disks survive: non-standard sector sizes, deleted-data address marks, duplicate IDs and CRC anomalies are surfaced in a **sector inspector**. Many games (Fray, Xak, ...) show only 1-2 catalogued files while the rest of the disk is **RAW uncatalogued sector data** read directly by a custom loader (not encryption); a **cluster map + RAW extractor/importer + block carver** makes that data visible, exportable, editable-and-reimportable, and splittable into BLOAD/BASIC segments. |
 | **FAT12 filesystem** | MSX-DOS disks: boot/BPB, FAT chains, root + subdirectories, volume label, free space, file extraction, **deleted-entry recovery**, and **read/write** (overwrite / grow / shrink with automatic cluster (re)allocation across both FAT copies, delete). |
 | **MSX files** | Type detection (tokenized BASIC `0xFF`, BLOAD binary `0xFE`, ASCII, data), a full **BASIC detokenizer** and an inverse **tokenizer** (edit a listing as text and save it back tokenized). Handles standard + `0xFF`-extended tokens, hex/oct/int/BCD-float constants, line references, string & REM literals. |
 | **Cartridge ROMs** | Size / page count, `AB` header + entry points (INIT/STATEMENT/DEVICE/TEXT), and **mapper detection** (None / Konami / Konami SCC / ASCII8 / ASCII16) via the openMSX-style write-target heuristic. |
@@ -47,6 +47,8 @@ msxforge put     <image> <FILE> <hostfile> [outimage]   overwrite a file
 msxforge del     <image> <FILE> [outimage]              delete a file
 msxforge protect <image>              physical sector / protection inspector
 msxforge raw     <image> [out.bin]    cluster map (named/RAW/free) + extract RAW data
+msxforge carve   <image>              split the RAW region into BLOAD/BASIC/gap blocks
+msxforge rawput  <image> <hostfile> [outimage]   write RAW data back into the image
 msxforge rominfo <rom>
 msxforge cas     <cas>
 ```

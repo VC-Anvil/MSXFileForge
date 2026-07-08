@@ -20,7 +20,7 @@ g++ -std=c++17 -O2 -DSDL_MAIN_HANDLED \
   gui/main.cpp $CORE \
   libs/imgui/imgui.cpp libs/imgui/imgui_draw.cpp libs/imgui/imgui_tables.cpp libs/imgui/imgui_widgets.cpp \
   libs/imgui/backends/imgui_impl_sdl2.cpp libs/imgui/backends/imgui_impl_opengl3.cpp \
-  libs/SDL2/lib/SDL2.dll -lopengl32 -lcomdlg32 \
+  libs/SDL2/lib/SDL2.dll -lopengl32 -lcomdlg32 -lshell32 \
   -o build/msxforge-gui.exe
 cp -f libs/SDL2/lib/SDL2.dll build/
 

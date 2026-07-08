@@ -237,6 +237,43 @@ static int cmd_raw(int argc, char** argv) {
     return 0;
 }
 
+static int cmd_carve(int argc, char** argv) {
+    if (argc < 3) { fprintf(stderr, "need <image>\n"); return 1; }
+    DiskImage dk; Fat12 fs;
+    int rc = mountDisk(argv[2], dk, fs); if (rc) return rc;
+    auto raw = fs.extractRawUnnamed();
+    auto blocks = carveBlocks(raw);
+    printf("RAW region: %zu bytes, %zu carved block(s):\n", raw.size(), blocks.size());
+    int shown = 0;
+    for (auto& b : blocks) {
+        if (b.type == CarveType::Unknown && b.length < 512) continue;
+        printf("  @0x%06lX  %-16s len=%-7ld", b.offset, carveTypeName(b.type), b.length);
+        if (b.type == CarveType::Bload)
+            printf("  start=%04X end=%04X exec=%04X", b.start, b.end, b.exec);
+        printf("\n");
+        if (++shown >= 60) { printf("  ...\n"); break; }
+    }
+    int nb=0,nB=0,nu=0; for (auto&b:blocks){ if(b.type==CarveType::Bload)nb++; else if(b.type==CarveType::BasicTokenized)nB++; else nu++; }
+    printf("Totals: %d BLOAD, %d BASIC, %d unknown-gap\n", nb, nB, nu);
+    return 0;
+}
+
+static int cmd_rawput(int argc, char** argv) {
+    // rawput <image> <hostfile> [outimage]
+    if (argc < 4) { fprintf(stderr, "need <image> <hostfile> [outimage]\n"); return 1; }
+    DiskImage dk; Fat12 fs;
+    int rc = mountDisk(argv[2], dk, fs); if (rc) return rc;
+    auto data = slurp(argv[3]);
+    long written = 0; std::string err;
+    bool ok = fs.writeRawUnnamed(data, &written, &err);
+    printf("wrote %ld of %zu bytes into RAW region%s\n", written, data.size(),
+           ok ? "" : (" (" + err + ")").c_str());
+    const char* out = (argc >= 5) ? argv[4] : argv[2];
+    if (!dk.save(out, &err)) { fprintf(stderr, "save: %s\n", err.c_str()); return 7; }
+    printf("saved -> %s\n", out);
+    return ok ? 0 : 8;
+}
+
 static int cmd_rominfo(const char* path) {
     auto d = slurp(path);
     if (d.empty()) { fprintf(stderr, "cannot read %s\n", path); return 2; }
@@ -283,6 +320,8 @@ int main(int argc, char** argv) {
     if (cmd == "del")     return cmd_del(argc, argv);
     if (cmd == "tok")     return cmd_tok(argc, argv);
     if (cmd == "raw")     return cmd_raw(argc, argv);
+    if (cmd == "carve")   return cmd_carve(argc, argv);
+    if (cmd == "rawput")  return cmd_rawput(argc, argv);
     if (cmd == "rominfo") return cmd_rominfo(argv[2]);
     if (cmd == "cas")     return cmd_cas(argv[2]);
     fprintf(stderr, "unknown command: %s\n", cmd.c_str());

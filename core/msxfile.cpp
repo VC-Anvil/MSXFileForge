@@ -191,6 +191,85 @@ std::string detokenizeBasic(const std::vector<uint8_t>& d) {
     return out;
 }
 
+// ---- Block carving --------------------------------------------------------
+
+const char* carveTypeName(CarveType t) {
+    switch (t) {
+        case CarveType::Bload:          return "BLOAD binary";
+        case CarveType::BasicTokenized: return "Tokenized BASIC";
+        default:                        return "Unknown / data";
+    }
+}
+
+// Length of a tokenized BASIC program starting at d[pos] (d[pos]==0xFF), or 0 if
+// it does not parse as at least one valid line ending in a 0x0000 link.
+static long basicProgramLength(const std::vector<uint8_t>& d, long pos) {
+    long p = pos + 1, n = (long)d.size();
+    int lines = 0;
+    while (p + 4 <= n) {
+        uint16_t link = (uint16_t)(d[p] | (d[p+1] << 8));
+        if (link == 0) return (p + 2) - pos;   // program terminator
+        p += 4;
+        long guard = 0;
+        while (p < n && d[p] != 0x00 && guard++ < 4096) p++;
+        if (p >= n) return 0;
+        p++;                                    // skip line terminator
+        if (++lines > 20000) return 0;
+    }
+    return 0;
+}
+
+std::vector<CarvedBlock> carveBlocks(const std::vector<uint8_t>& d) {
+    std::vector<CarvedBlock> out;
+    long n = (long)d.size();
+    long pos = 0, gapStart = -1;
+    bool afterBlock = false;
+
+    auto flushGap = [&](long end) {
+        if (gapStart >= 0 && end > gapStart) {
+            CarvedBlock g; g.offset = gapStart; g.length = end - gapStart;
+            g.type = CarveType::Unknown; out.push_back(g);
+        }
+        gapStart = -1;
+    };
+
+    while (pos < n) {
+        bool boundary = (pos % 512 == 0) || afterBlock;
+        bool matched = false;
+        if (boundary) {
+            if (d[pos] == 0xFE && pos + 7 <= n) {
+                uint16_t s = d[pos+1] | (d[pos+2]<<8);
+                uint16_t e = d[pos+3] | (d[pos+4]<<8);
+                uint16_t x = d[pos+5] | (d[pos+6]<<8);
+                long payload = (long)e - s + 1;
+                if (e >= s && payload >= 1 && pos + 7 + payload <= n) {
+                    flushGap(pos);
+                    CarvedBlock b; b.offset = pos; b.length = 7 + payload;
+                    b.type = CarveType::Bload; b.start = s; b.end = e; b.exec = x;
+                    out.push_back(b);
+                    pos += b.length; afterBlock = true; matched = true;
+                }
+            } else if (d[pos] == 0xFF) {
+                long len = basicProgramLength(d, pos);
+                if (len > 4) {
+                    flushGap(pos);
+                    CarvedBlock b; b.offset = pos; b.length = len;
+                    b.type = CarveType::BasicTokenized;
+                    out.push_back(b);
+                    pos += len; afterBlock = true; matched = true;
+                }
+            }
+        }
+        if (!matched) {
+            if (gapStart < 0) gapStart = pos;
+            afterBlock = false;
+            pos++;
+        }
+    }
+    flushGap(n);
+    return out;
+}
+
 // ---- Tokenizer (text -> tokenized BASIC) ----------------------------------
 
 namespace {

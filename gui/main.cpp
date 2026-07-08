@@ -13,6 +13,7 @@
 #include <SDL_syswm.h>
 #include <windows.h>
 #include <commdlg.h>
+#include <shellapi.h>
 
 #include "imgui.h"
 #include "backends/imgui_impl_sdl2.h"
@@ -62,6 +63,11 @@ struct App {
     RomInfo rom;
     std::vector<CasBlock> cas;
 
+    // RAW carve state
+    std::vector<uint8_t> rawCache;
+    std::vector<CarvedBlock> carved;
+    bool carvedDone = false;
+
     // Poke control
     char pokeOff[16] = "0";
     char pokeVal[8] = "00";
@@ -92,6 +98,7 @@ static bool hasExt(const std::string& p, const char* e) {
     for (auto& c : t) c = (char)tolower((unsigned char)c);
     return t == e;
 }
+static void openUrl(const char* url) { ShellExecuteA(nullptr, "open", url, nullptr, nullptr, SW_SHOWNORMAL); }
 
 static std::string openDialog(HWND owner, const char* filter) {
     char file[1024] = "";
@@ -147,6 +154,7 @@ static void selectFile(App& a, int idx) {
 static void openPath(App& a, const std::string& path) {
     a.imagePath = path; a.mode = Mode::None; a.fsMounted = false;
     a.listing.clear(); a.cas.clear(); a.blob.clear(); a.cwd = "/";
+    a.carved.clear(); a.rawCache.clear(); a.carvedDone = false;
     clearSelection(a);
     strncpy(a.pathInput, path.c_str(), sizeof(a.pathInput)-1);
 
@@ -371,7 +379,7 @@ static void drawRawMap(App& a) {
     ImGui::SameLine(); ImGui::Text("   Free:"); ImGui::SameLine();
     ImGui::TextDisabled("%ld KB", freeN*cb/1024);
 
-    if (ImGui::Button("Export RAW data (unnamed) to file...")) {
+    if (ImGui::Button("Export RAW data (unnamed)...")) {
         auto d = a.fs.extractRawUnnamed();
         std::string p = saveDialog(a.hwnd, "Binary\0*.bin\0All files\0*.*\0", "bin", "raw_data.bin");
         if (!p.empty()) { dump(p, d.data(), d.size());
@@ -379,10 +387,73 @@ static void drawRawMap(App& a) {
     }
     help("Concatenate every allocated-but-unnamed cluster (the uncatalogued game data) and save it to your PC.");
     ImGui::SameLine();
+    if (ImGui::Button("Import RAW data (replace)...")) {
+        std::string p = openDialog(a.hwnd, "Binary\0*.bin\0All files\0*.*\0");
+        if (!p.empty()) {
+            auto d = slurp(p);
+            long wrote = 0; std::string err;
+            bool ok = a.fs.writeRawUnnamed(d, &wrote, &err);
+            a.carvedDone = false; a.carved.clear(); a.rawCache.clear();
+            a.status = ok ? ("Imported " + std::to_string(wrote) + " bytes into RAW region (image modified)")
+                          : ("Imported " + std::to_string(wrote) + " bytes - " + err);
+        }
+    }
+    help("Write a previously-exported (and possibly edited) RAW blob back into the same unnamed clusters. "
+         "Same-size data restores byte-for-byte; larger data is truncated to the RAW capacity.");
+    ImGui::SameLine();
     if (ImGui::Button("Export whole image...")) {
         std::string p = saveDialog(a.hwnd, "All files\0*.*\0", "", a.imagePath.c_str());
         if (!p.empty()) { dump(p, a.disk.raw().data(), a.disk.raw().size());
             a.status = "Exported whole image -> " + p; }
+    }
+    ImGui::Separator();
+
+    // Block carving: split the RAW region into BLOAD / BASIC / gaps.
+    if (ImGui::Button(a.carvedDone ? "Re-scan blocks" : "Carve into blocks")) {
+        a.rawCache = a.fs.extractRawUnnamed();
+        a.carved = carveBlocks(a.rawCache);
+        a.carvedDone = true;
+    }
+    help("Scan the RAW region for recognizable segments: BLOAD images (0xFE header), tokenized BASIC "
+         "programs (0xFF), and the data gaps between them. Each block can be exported on its own.");
+    if (a.carvedDone) {
+        int nB=0,nb=0,nu=0;
+        for (auto& b : a.carved) { if (b.type==CarveType::Bload) nb++; else if (b.type==CarveType::BasicTokenized) nB++; else nu++; }
+        ImGui::SameLine(); ImGui::TextDisabled("%d BLOAD, %d BASIC, %d gaps", nb, nB, nu);
+        ImGui::BeginChild("blocks", ImVec2(0, 200), true);
+        if (ImGui::BeginTable("carve", 5, ImGuiTableFlags_RowBg|ImGuiTableFlags_BordersInnerH|ImGuiTableFlags_ScrollY)) {
+            ImGui::TableSetupColumn("Offset", ImGuiTableColumnFlags_WidthFixed, 84);
+            ImGui::TableSetupColumn("Type",   ImGuiTableColumnFlags_WidthFixed, 130);
+            ImGui::TableSetupColumn("Size",   ImGuiTableColumnFlags_WidthFixed, 78);
+            ImGui::TableSetupColumn("BLOAD addr", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 70);
+            ImGui::TableHeadersRow();
+            for (int i = 0; i < (int)a.carved.size(); ++i) {
+                const CarvedBlock& b = a.carved[i];
+                if (b.type == CarveType::Unknown && b.length < 512) continue;
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn(); ImGui::Text("0x%06lX", b.offset);
+                ImGui::TableNextColumn();
+                ImVec4 tc = b.type==CarveType::Bload ? kAccent : b.type==CarveType::BasicTokenized ? kGreen : ImGui::GetStyle().Colors[ImGuiCol_TextDisabled];
+                ImGui::TextColored(tc, "%s", carveTypeName(b.type));
+                ImGui::TableNextColumn(); ImGui::Text("%ld", b.length);
+                ImGui::TableNextColumn();
+                if (b.type==CarveType::Bload) ImGui::TextDisabled("%04X-%04X exec %04X", b.start, b.end, b.exec);
+                else ImGui::TextDisabled("-");
+                ImGui::TableNextColumn();
+                ImGui::PushID(i);
+                if (ImGui::SmallButton("Export")) {
+                    const char* ext = b.type==CarveType::Bload ? "bin" : b.type==CarveType::BasicTokenized ? "bas" : "bin";
+                    char sug[64]; snprintf(sug, sizeof sug, "block_%06lX.%s", b.offset, ext);
+                    std::string p = saveDialog(a.hwnd, "All files\0*.*\0", ext, sug);
+                    if (!p.empty() && b.offset + b.length <= (long)a.rawCache.size())
+                        dump(p, a.rawCache.data() + b.offset, b.length);
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        ImGui::EndChild();
     }
     ImGui::Separator();
 
@@ -394,9 +465,11 @@ static void drawRawMap(App& a) {
     ImGui::ColorButton("##f", ImVec4(0.22f,0.24f,0.28f,1), ImGuiColorEditFlags_NoTooltip, ImVec2(14,14));
     ImGui::SameLine(); ImGui::TextUnformatted("free");
 
-    // Heatmap
+    // Heatmap (columns adapt to the available width)
     int n = (int)map.size();
-    const int cols = 48; const float cell = 12.0f, pad = 1.5f;
+    const float cell = 12.0f, pad = 1.5f;
+    int cols = (int)(ImGui::GetContentRegionAvail().x / cell);
+    if (cols < 8) cols = 8;
     int rows = (n + cols - 1) / cols;
     ImVec2 origin = ImGui::GetCursorScreenPos();
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -641,11 +714,24 @@ static void drawCas(App& a) {
 
 static void drawManual(App& a) {
     if (!a.showManual) return;
-    ImGui::SetNextWindowSize(ImVec2(620, 560), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(680, 620), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Manual / Help", &a.showManual)) {
         ImGui::TextColored(kAccent, "MSXFileForge - what everything does");
         ImGui::Separator();
-        auto H = [](const char* t){ ImGui::Spacing(); ImGui::TextColored(kDir, "%s", t); };
+        // Visual section header: an accent chip with the title inside.
+        auto H = [](const char* t){
+            ImGui::Spacing();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            float h = ImGui::GetTextLineHeight() + 6;
+            dl->AddRectFilled(p, ImVec2(p.x + 6, p.y + h), IM_COL32(90,180,235,255), 2);
+            dl->AddRectFilled(ImVec2(p.x, p.y), ImVec2(p.x + ImGui::GetContentRegionAvail().x, p.y + h),
+                              IM_COL32(90,180,235,28), 3);
+            ImGui::Dummy(ImVec2(10, 0)); ImGui::SameLine();
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 3);
+            ImGui::TextColored(kDir, "%s", t);
+            ImGui::Dummy(ImVec2(0, 3));
+        };
         auto P = [](const char* t){ ImGui::PushTextWrapPos(0); ImGui::TextUnformatted(t); ImGui::PopTextWrapPos(); };
 
         H("Opening media");
@@ -674,16 +760,37 @@ static void drawManual(App& a) {
           "Save image as (Ctrl+Shift+S). The status bar shows when the image has unsaved changes.");
 
         H("Protected / RAW disks");
-        P("Some games show only 1-2 files in the tree but the disk is nearly full. The bulk is RAW data: "
-          "sectors that are allocated but have NO directory entry, read directly by the game's loader. "
-          "This is NOT encryption - the data is fully readable. Open the 'RAW data / map' tab to see a "
-          "colour map (green = named, orange = RAW, grey = free) and to Export the RAW region to your PC.\n"
-          "For .dmk track images, the 'Protection / sectors' tab shows the physical sector layout: "
-          "non-standard sizes, deleted-data marks and CRC anomalies are flagged in orange.");
+        P("Some games (Fray, Xak, ...) show only 1-2 files in the tree but the disk is nearly full. The "
+          "bulk is RAW data: sectors that are allocated but have NO directory entry, read directly by the "
+          "game's loader. This is NOT encryption - the data is fully readable.\n"
+          "In the 'RAW data / map' tab you can:\n"
+          "  - see a colour map (green = named, orange = RAW, grey = free);\n"
+          "  - Export the RAW region, or Export the whole image;\n"
+          "  - Import RAW data back in (edit-and-replace round-trips byte-for-byte);\n"
+          "  - Carve the RAW region into recognizable blocks (BLOAD images, BASIC programs, gaps) and "
+          "export any block on its own.\n"
+          "For .dmk track images, the 'Protection / sectors' tab shows the physical layout: non-standard "
+          "sizes, deleted-data marks and CRC anomalies flagged in orange.");
 
         H("ROM / CAS");
         P("ROMs show size, page count, the AB header entry points and a detected mapper "
           "(Konami / SCC / ASCII8 / ASCII16). CAS files show their block layout and file names.");
+
+        H("Sources & references");
+        struct Src { const char* label; const char* url; };
+        static const Src srcs[] = {
+            {"Generation MSX - Fray in Magical Adventure", "https://www.generation-msx.nl/software/microcabin/fray---in-magical-adventure/release/1838/"},
+            {"MSX.org - Disk copy protections", "https://www.msx.org/forum/msx-talk/general-discussion/disk-copy-protections"},
+            {"The Cutting Room Floor - Fray (MSX2)", "https://tcrf.net/Fray:_In_Magical_Adventure_(MSX2)"},
+            {"MSX Wiki - MSX-BASIC file formats", "https://www.msx.org/wiki/MSX-BASIC_file_formats"},
+        };
+        for (auto& s : srcs) {
+            ImGui::Bullet();
+            ImGui::TextColored(kAccent, "%s", s.label);
+            if (ImGui::IsItemHovered()) { ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                ImGui::SetTooltip("%s\n(click to open in browser)", s.url); }
+            if (ImGui::IsItemClicked()) openUrl(s.url);
+        }
         ImGui::Spacing();
         ImGui::TextDisabled("Tip: hover any (?) marker for context help.");
     }
@@ -694,16 +801,16 @@ static void drawAbout(App& a) {
     if (!a.showAbout) return;
     ImGui::SetNextWindowSize(ImVec2(420, 220), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("About MSXFileForge", &a.showAbout)) {
-        ImGui::TextColored(kAccent, "MSXFileForge  v0.3");
+        ImGui::TextColored(kAccent, "MSXFileForge  v0.4");
         ImGui::TextWrapped("A native editor/inspector for MSX disk images, files, ROMs and tapes, "
-                           "with protected/RAW (.dmk) support and a raw-sector browser.");
+                           "with protected/RAW (.dmk) support and a raw-sector browser/carver.");
         ImGui::Separator();
-        ImGui::Text("Author:  Alonso  (GitHub: GS-RUN)");
-        ImGui::Text("Built with Claude Code (Opus 4.8).");
-        ImGui::Text("License: see repository.");
+        ImGui::TextDisabled("Author");
+        ImGui::Text("Alonso");
+        ImGui::TextColored(kAccent, "GS\xC2\xB7RUN");
         ImGui::Spacing();
+        ImGui::TextDisabled("Built with Claude Code (Opus 4.8).  License: see repository.");
         ImGui::TextDisabled("Bundles Dear ImGui (MIT) and SDL2 (zlib).");
-        ImGui::TextDisabled("FAT12 read/write, BASIC (de)tokenizer, ROM mapper detection, cassette parser.");
     }
     ImGui::End();
 }
@@ -827,7 +934,10 @@ int main(int argc, char** argv) {
                 ImGui::Text("OEM '%s'  free %ld KB", app.fs.oemName().c_str(), app.fs.freeBytes()/1024);
             }
             ImGui::Separator();
-            ImGui::BeginChild("left", ImVec2(440, 0), true);
+            float leftW = ImGui::GetContentRegionAvail().x * 0.32f;
+            if (leftW < 280) leftW = 280;
+            if (leftW > 520) leftW = 520;
+            ImGui::BeginChild("left", ImVec2(leftW, 0), true);
             drawFileTree(app);
             ImGui::EndChild();
             ImGui::SameLine();
