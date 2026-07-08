@@ -1028,7 +1028,7 @@ static void drawAbout(App& a) {
     if (!a.showAbout) return;
     ImGui::SetNextWindowSize(ImVec2(420, 220), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("About MSXFileForge", &a.showAbout)) {
-        ImGui::TextColored(kAccent, "MSXFileForge  v0.4");
+        ImGui::TextColored(kAccent, "MSXFileForge  v0.5");
         ImGui::TextWrapped("A native editor/inspector for MSX disk images, files, ROMs and tapes, "
                            "with protected/RAW (.dmk) support and a raw-sector browser/carver.");
         ImGui::Separator();
