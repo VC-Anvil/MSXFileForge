@@ -15,8 +15,11 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest,  name: linux }
-          - { os: macos-13,       name: macos-x86_64 }   # Intel runner
-          - { os: macos-14,       name: macos-arm64 }    # Apple Silicon runner
+          # Both macOS builds run on the reliable Apple-Silicon runner: one native
+          # arm64, one cross-compiled to x86_64 (static SDL2 from source), so the
+          # Intel build no longer depends on scarce Intel-runner capacity.
+          - { os: macos-14,       name: macos-arm64,  mac_arch: arm64 }
+          - { os: macos-14,       name: macos-x86_64, mac_arch: x86_64 }
           - { os: windows-latest, name: windows }
     steps:
       - uses: actions/checkout@v4
@@ -25,20 +28,39 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y cmake build-essential libsdl2-dev libgl1-mesa-dev
 
-      - name: Install deps (macOS)
-        if: runner.os == 'macOS'
+      - name: Install deps (macOS arm64, native)
+        if: matrix.mac_arch == 'arm64'
         run: brew install sdl2
 
+      - name: Build x86_64 SDL2 from source (macOS cross)
+        if: matrix.mac_arch == 'x86_64'
+        run: |
+          git clone --depth 1 -b release-2.30.x https://github.com/libsdl-org/SDL SDLsrc
+          cmake -S SDLsrc -B sdlbuild -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
+            -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/sdlx86"
+          cmake --build sdlbuild -j3 --target install
+
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        shell: bash
+        run: |
+          if [ "${{ matrix.mac_arch }}" = "x86_64" ]; then
+            cmake -B build -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
+              -DCMAKE_PREFIX_PATH="$PWD/sdlx86"
+          else
+            cmake -B build -DCMAKE_BUILD_TYPE=Release
+          fi
 
       - name: Build
-        run: cmake --build build --config Release -j 2
+        shell: bash
+        run: cmake --build build --config Release -j 3
 
       - name: Verify arch (macOS)
         if: runner.os == 'macOS'
         run: |
-          echo "runner arch: $(uname -m)"
+          echo "runner arch: $(uname -m)  target: ${{ matrix.name }}"
           file build/msxforge-gui
           lipo -archs build/msxforge-gui || true
 
