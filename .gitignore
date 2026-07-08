@@ -1,0 +1,8 @@
+/build/
+*.o
+*.obj
+*.exe
+*.pdb
+*.ilk
+# keep the shipped SDL2 runtime dll under libs/
+!libs/SDL2/lib/SDL2.dll
