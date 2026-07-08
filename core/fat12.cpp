@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <sstream>
 #include <iomanip>
+#include <functional>
 
 namespace msx {
 
@@ -449,6 +450,161 @@ bool Fat12::writeRawUnnamed(const std::vector<uint8_t>& data, long* written, std
     if (written) *written = pos;
     if (pos < total) { if (err) *err = "data larger than RAW capacity; truncated"; return false; }
     return true;
+}
+
+// ---- Directory writes: create / rename / mkdir ----------------------------
+
+void Fat12::pack83(const std::string& name, uint8_t out[11]) {
+    memset(out, ' ', 11);
+    if (name == ".") { out[0] = '.'; return; }
+    if (name == "..") { out[0] = '.'; out[1] = '.'; return; }
+    size_t dot = name.find_last_of('.');
+    std::string base = (dot == std::string::npos) ? name : name.substr(0, dot);
+    std::string ext  = (dot == std::string::npos) ? ""   : name.substr(dot + 1);
+    for (size_t i = 0; i < base.size() && i < 8; ++i) out[i] = (uint8_t)toupper((unsigned char)base[i]);
+    for (size_t i = 0; i < ext.size()  && i < 3; ++i) out[8 + i] = (uint8_t)toupper((unsigned char)ext[i]);
+}
+
+int Fat12::resolveDirCluster(const std::string& path) const {
+    std::vector<std::string> parts; std::string cur;
+    for (char c : path) { if (c == '/' || c == '\\') { if (!cur.empty()) { parts.push_back(cur); cur.clear(); } } else cur.push_back(c); }
+    if (!cur.empty()) parts.push_back(cur);
+    if (parts.empty()) return 0; // root
+    std::vector<DirEntry> dir = readRootDir(false);
+    int cluster = 0;
+    for (size_t p = 0; p < parts.size(); ++p) {
+        std::string want = parts[p]; for (auto& c : want) c = (char)toupper((unsigned char)c);
+        const DirEntry* found = nullptr;
+        for (auto& e : dir) {
+            if (!e.isDir()) continue;
+            std::string nm = e.name; for (auto& c : nm) c = (char)toupper((unsigned char)c);
+            if (nm == want) { found = &e; break; }
+        }
+        if (!found) return -1;
+        cluster = found->startCluster;
+        if (p + 1 < parts.size()) dir = readDirAtCluster(cluster, false);
+    }
+    return cluster;
+}
+
+long Fat12::freeDirSlot(int dirCluster) {
+    if (dirCluster == 0) {
+        for (int i = 0; i < ndir_; ++i) {
+            long off = rootStartSec_ * 512 + (long)i * 32;
+            uint8_t b; if (!readByteAt(off, b)) return -1;
+            if (b == 0x00 || b == 0xE5) return off;
+        }
+        return -1;
+    }
+    int slotsPerCluster = spc_ * 512 / 32;
+    for (int c : chainOf(dirCluster)) {
+        long firstSec = dataStartSec_ + (long)(c - 2) * spc_;
+        for (int s = 0; s < slotsPerCluster; ++s) {
+            long off = firstSec * 512 + (long)s * 32;
+            uint8_t b; if (!readByteAt(off, b)) return -1;
+            if (b == 0x00 || b == 0xE5) return off;
+        }
+    }
+    return -1;
+}
+
+void Fat12::writeDirEntry(long off, const uint8_t name11[11], uint8_t attr,
+                          uint16_t cluster, uint32_t size) {
+    uint8_t e[32]; memset(e, 0, sizeof e);
+    memcpy(e, name11, 11);
+    e[0x0B] = attr;
+    e[0x1A] = cluster & 0xFF; e[0x1B] = (cluster >> 8) & 0xFF;
+    e[0x1C] = size & 0xFF; e[0x1D] = (size >> 8) & 0xFF;
+    e[0x1E] = (size >> 16) & 0xFF; e[0x1F] = (size >> 24) & 0xFF;
+    for (int i = 0; i < 32; ++i) writeByteAt(off + i, e[i]);
+}
+
+bool Fat12::createFile(const std::string& dirPath, const std::string& name,
+                       const std::vector<uint8_t>& data, std::string* err) {
+    if (!mounted_) { if (err) *err = "not mounted"; return false; }
+    int dc = resolveDirCluster(dirPath);
+    if (dc < 0) { if (err) *err = "directory not found"; return false; }
+    // Reject a duplicate name.
+    std::string up = name; for (auto& c : up) c = (char)toupper((unsigned char)c);
+    for (auto& e : list(dirPath, false)) {
+        std::string nm = e.name; for (auto& c : nm) c = (char)toupper((unsigned char)c);
+        if (nm == up) { if (err) *err = "a file with that name already exists"; return false; }
+    }
+    long slot = freeDirSlot(dc);
+    if (slot < 0) { if (err) *err = "directory is full"; return false; }
+    uint8_t nm[11]; pack83(name, nm);
+    writeDirEntry(slot, nm, 0x20 /*archive*/, 0, 0);
+    DirEntry tmp; tmp.entryOffset = slot; tmp.startCluster = 0; tmp.size = 0; tmp.attr = 0x20;
+    return writeFile(tmp, data, err);   // allocates clusters + updates size/start
+}
+
+bool Fat12::renameEntry(DirEntry& e, const std::string& newName, std::string* err) {
+    if (!mounted_ || e.entryOffset < 0) { if (err) *err = "cannot rename"; return false; }
+    uint8_t nm[11]; pack83(newName, nm);
+    for (int i = 0; i < 11; ++i) writeByteAt(e.entryOffset + i, nm[i]);
+    e.raw83.assign((const char*)nm, 11);
+    return true;
+}
+
+bool Fat12::makeDir(const std::string& parentPath, const std::string& name, std::string* err) {
+    if (!mounted_) { if (err) *err = "not mounted"; return false; }
+    int parent = resolveDirCluster(parentPath);
+    if (parent < 0) { if (err) *err = "parent directory not found"; return false; }
+    std::string up = name; for (auto& c : up) c = (char)toupper((unsigned char)c);
+    for (auto& e : list(parentPath, false)) {
+        std::string nm = e.name; for (auto& c : nm) c = (char)toupper((unsigned char)c);
+        if (nm == up) { if (err) *err = "name already exists"; return false; }
+    }
+    long slot = freeDirSlot(parent);
+    if (slot < 0) { if (err) *err = "parent directory is full"; return false; }
+    int nc = allocCluster();
+    if (nc < 0) { if (err) *err = "disk full"; return false; }
+    setFatEntry(nc, 0xFFF);
+    // Zero the new directory cluster, then write . and .. entries.
+    long firstSec = dataStartSec_ + (long)(nc - 2) * spc_;
+    uint8_t zero[512]; memset(zero, 0, sizeof zero);
+    for (int s = 0; s < spc_; ++s) disk_->writeLogicalSector(firstSec + s, zero);
+    uint8_t dot[11], dotdot[11]; pack83(".", dot); pack83("..", dotdot);
+    writeDirEntry(firstSec * 512 + 0,  dot,    0x10, (uint16_t)nc, 0);
+    writeDirEntry(firstSec * 512 + 32, dotdot, 0x10, (uint16_t)parent, 0);
+    // Add the entry to the parent.
+    uint8_t nm[11]; pack83(name, nm);
+    writeDirEntry(slot, nm, 0x10, (uint16_t)nc, 0);
+    return true;
+}
+
+// ---- Integrity check ------------------------------------------------------
+
+Fat12::FsCheck Fat12::verify() const {
+    FsCheck r;
+    if (!mounted_) { r.issues.push_back("filesystem not mounted"); return r; }
+    std::vector<int> owner(totalClusters_ > 0 ? totalClusters_ : 0, -1);
+    // Walk every named file/dir chain, flagging bad pointers and cross-links.
+    std::function<void(int, bool, const std::string&)> walk =
+        [&](int cluster, bool isRoot, const std::string& base) {
+        for (auto& e : (isRoot ? readRootDir(false) : readDirAtCluster(cluster, false))) {
+            if (e.name == "." || e.name == ".." || e.deleted || e.isVolume()) continue;
+            std::string path = base + "/" + e.name;
+            int c = e.startCluster, guard = 0;
+            while (c >= 2 && c < 0xFF8 && guard++ < totalClusters_ + 4) {
+                int idx = c - 2;
+                if (idx < 0 || idx >= (int)owner.size()) { r.issues.push_back(path + ": cluster out of range"); break; }
+                if (owner[idx] >= 0) { r.issues.push_back(path + ": cross-linked at cluster " + std::to_string(c)); break; }
+                owner[idx] = 1; r.usedByFiles++;
+                int nxt = fatEntry(c);
+                if (nxt == 0) { r.issues.push_back(path + ": chain hits a free cluster"); break; }
+                c = nxt;
+            }
+            if (e.isDir() && e.startCluster >= 2) walk(e.startCluster, false, path);
+        }
+    };
+    walk(0, true, "");
+    for (int c = 2; c < totalClusters_ + 2; ++c) {
+        int idx = c - 2;
+        if (fatEntry(c) == 0) r.freeClusters++;
+        else if (idx >= 0 && idx < (int)owner.size() && owner[idx] < 0) r.unreferenced++;
+    }
+    return r;
 }
 
 } // namespace msx

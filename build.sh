@@ -6,7 +6,7 @@ export PATH="$MINGW:$PATH"
 cd "$(dirname "$0")"
 mkdir -p build
 
-CORE="core/disk_image.cpp core/fat12.cpp core/msxfile.cpp core/rom.cpp core/cas.cpp"
+CORE="core/disk_image.cpp core/fat12.cpp core/msxfile.cpp core/rom.cpp core/cas.cpp core/util.cpp"
 
 echo "[1/3] CLI"
 g++ -std=c++17 -O2 -o build/msxforge.exe cli/main.cpp $CORE

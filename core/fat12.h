@@ -69,6 +69,24 @@ public:
     // Mark a file deleted (0xE5) and free its clusters. Re-list afterwards.
     bool deleteFile(const DirEntry& e, std::string* err = nullptr);
 
+    // Create a NEW file `name` (8.3) in directory `dirPath` ("/" or "/SUB")
+    // with the given bytes. Fails if the name exists or the directory is full.
+    bool createFile(const std::string& dirPath, const std::string& name,
+                    const std::vector<uint8_t>& data, std::string* err = nullptr);
+
+    // Rename an entry in place (8.3). Updates `e`.
+    bool renameEntry(DirEntry& e, const std::string& newName, std::string* err = nullptr);
+
+    // Create a subdirectory `name` inside `parentPath` (with . and .. entries).
+    bool makeDir(const std::string& parentPath, const std::string& name, std::string* err = nullptr);
+
+    // Filesystem integrity report.
+    struct FsCheck {
+        long freeClusters = 0, usedByFiles = 0, unreferenced = 0;
+        std::vector<std::string> issues;   // empty == clean
+    };
+    FsCheck verify() const;
+
     // ---- RAW / uncatalogued data ----
     // Many MSX games (Fray, Xak, ...) store their bulk data in raw sectors that
     // are marked allocated in the FAT but have NO directory entry - a custom
@@ -99,6 +117,11 @@ public:
     int dataClusterCount() const { return totalClusters_; }
 
 private:
+    int  resolveDirCluster(const std::string& path) const; // 0=root, -1=not found
+    long freeDirSlot(int dirCluster);                       // image offset or -1
+    void writeDirEntry(long off, const uint8_t name11[11], uint8_t attr,
+                       uint16_t cluster, uint32_t size);
+    static void pack83(const std::string& name, uint8_t out[11]);
     void collectNamedClusters(int cluster, std::vector<uint8_t>& status, bool isRoot) const;
     bool writeByteAt(long imageOffset, uint8_t value);
     bool readByteAt(long imageOffset, uint8_t& out) const;

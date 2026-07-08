@@ -39,6 +39,7 @@
 #include "../core/msxfile.h"
 #include "../core/rom.h"
 #include "../core/cas.h"
+#include "../core/util.h"
 
 #include <string>
 #include <vector>
@@ -90,6 +91,19 @@ struct App {
     char pathInput[1024] = {0};
     bool showManual = false;
     bool showAbout = false;
+
+    // B1/B3 UI state
+    bool openRename = false, openNewFolder = false;
+    char nameBuf[16] = {0};
+    bool backupOnSave = true;
+    bool showFsck = false;
+    Fat12::FsCheck fsck;
+    char hexFind[64] = {0};
+    char hexGoto[16] = {0};
+    long hexTarget = -1;    // offset to scroll to / highlight in the hex view
+    long hexSearchNext = 0; // resume position for Find-next
+    bool hexScrollPending = false;
+    std::string openmsxPath;
 };
 
 // ---- IO helpers -----------------------------------------------------------
@@ -111,6 +125,10 @@ static bool hasExt(const std::string& p, const char* e) {
     std::string t = p.substr(p.size()-n);
     for (auto& c : t) c = (char)tolower((unsigned char)c);
     return t == e;
+}
+static std::string fileBaseName(const std::string& p) {
+    size_t s = p.find_last_of("/\\");
+    return s == std::string::npos ? p : p.substr(s + 1);
 }
 static void openUrl(const char* url) {
 #if defined(_WIN32)
@@ -241,9 +259,36 @@ static void saveImageAs(App& a) {
 }
 static void saveImage(App& a) {
     if (a.imagePath.empty()) { saveImageAs(a); return; }
+    if (a.backupOnSave) {                       // keep a .bak of the previous state
+        auto prev = slurp(a.imagePath);
+        if (!prev.empty()) dump(a.imagePath + ".bak", prev.data(), prev.size());
+    }
     std::string err;
-    if (a.disk.save(a.imagePath, &err)) { a.disk.clearDirty(); a.status = "Image saved: " + a.imagePath; }
+    if (a.disk.save(a.imagePath, &err)) { a.disk.clearDirty(); a.status = "Image saved: " + a.imagePath +
+        (a.backupOnSave ? "  (.bak kept)" : ""); }
     else a.status = "Save failed: " + err;
+}
+
+static void newBlankDisk(App& a, int totalSectors) {
+    std::string p = saveDialog("New blank disk", totalSectors == 720 ? "blank360.dsk" : "blank720.dsk",
+                               {"*.dsk"}, "MSX disk image");
+    if (p.empty()) return;
+    auto img = formatBlankImage(totalSectors);
+    if (!dump(p, img.data(), img.size())) { a.status = "Cannot write " + p; return; }
+    openPath(a, p);
+    a.status = "Created blank " + std::to_string(totalSectors == 720 ? 360 : 720) + "KB disk: " + p;
+}
+
+static void openInEmulator(App& a) {
+    if (a.imagePath.empty()) { a.status = "No image loaded."; return; }
+    if (a.disk.dirty()) saveImage(a);
+#if defined(_WIN32)
+    std::string args = "-diska \"" + a.imagePath + "\"";
+    ShellExecuteA(nullptr, "open", "openmsx", args.c_str(), nullptr, SW_SHOWNORMAL);
+#else
+    std::string c = "openmsx -diska '" + a.imagePath + "' >/dev/null 2>&1 &"; (void)!system(c.c_str());
+#endif
+    a.status = "Launching openMSX (must be installed / on PATH) with " + a.imagePath;
 }
 
 // ---- Theme ----------------------------------------------------------------
@@ -327,7 +372,47 @@ static void drawHexEditor(App& a, std::vector<uint8_t>& d, const std::vector<uin
         help("Type an offset and a byte value in hex, then Set byte. Or click any byte in the grid to edit it inline. Modified bytes turn yellow.");
         ImGui::SameLine(); ImGui::TextDisabled("| click a byte to edit inline");
     }
+    // Find / goto / data inspector.
+    ImGui::SetNextItemWidth(180);
+    bool doFind = ImGui::InputText("##find", a.hexFind, sizeof a.hexFind, ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine(); if (ImGui::Button("Find")) doFind = true;
+    help("Search hex bytes (e.g. 21 00 20) or ASCII in quotes (e.g. \"AB\"). Find again continues from the last hit.");
+    if (doFind && a.hexFind[0]) {
+        std::vector<uint8_t> pat;
+        std::string q = a.hexFind;
+        if (q.front() == '"') { for (size_t i = 1; i < q.size() && q[i] != '"'; ++i) pat.push_back((uint8_t)q[i]); }
+        else { size_t i = 0; while (i < q.size()) { while (i < q.size() && q[i] == ' ') i++;
+                if (i + 1 < q.size() || (i < q.size() && isxdigit((unsigned char)q[i]))) {
+                    char b[3] = {0,0,0}; int n = 0; while (i < q.size() && isxdigit((unsigned char)q[i]) && n < 2) b[n++] = q[i++];
+                    if (n) pat.push_back((uint8_t)strtol(b, nullptr, 16)); } else break; } }
+        long found = -1;
+        if (!pat.empty() && d.size() >= pat.size()) {
+            for (long start = a.hexSearchNext; start <= (long)(d.size() - pat.size()); ++start)
+                if (memcmp(d.data() + start, pat.data(), pat.size()) == 0) { found = start; break; }
+            if (found < 0) for (long start = 0; start <= (long)(d.size() - pat.size()); ++start)
+                if (memcmp(d.data() + start, pat.data(), pat.size()) == 0) { found = start; break; } // wrap
+        }
+        if (found >= 0) { a.hexTarget = found; a.hexSearchNext = found + 1; a.hexScrollPending = true; }
+        else a.status = "not found: " + q;
+    }
+    ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
+    ImGui::SetNextItemWidth(90);
+    if (ImGui::InputText("goto", a.hexGoto, sizeof a.hexGoto, ImGuiInputTextFlags_CharsHexadecimal|ImGuiInputTextFlags_EnterReturnsTrue)
+        && a.hexGoto[0]) { a.hexTarget = strtol(a.hexGoto, nullptr, 16); a.hexScrollPending = true; }
+    // Data inspector at the current target offset.
+    if (a.hexTarget >= 0 && a.hexTarget < (long)d.size()) {
+        const uint8_t* p = d.data() + a.hexTarget; long rem = (long)d.size() - a.hexTarget;
+        uint16_t u16 = rem >= 2 ? (p[0] | (p[1] << 8)) : p[0];
+        uint32_t u32 = rem >= 4 ? (p[0] | (p[1]<<8) | (p[2]<<16) | ((uint32_t)p[3]<<24)) : u16;
+        ImGui::SameLine(); ImGui::TextColored(kMod, "@%06lX", a.hexTarget);
+        ImGui::SameLine(); ImGui::TextDisabled("u8=%u i8=%d u16=%u(0x%04X) u32=%u",
+            p[0], (int)(int8_t)p[0], u16, u16, u32);
+    }
     ImGui::BeginChild(id, ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
+    if (a.hexScrollPending && a.hexTarget >= 0) {
+        ImGui::SetScrollY((float)(a.hexTarget / 16) * ImGui::GetTextLineHeightWithSpacing());
+        a.hexScrollPending = false;
+    }
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 2));
     float charW = ImGui::CalcTextSize("F").x;
     ImGuiListClipper clip;
@@ -359,11 +444,13 @@ static void drawHexEditor(App& a, std::vector<uint8_t>& d, const std::vector<uin
                     }
                 } else {
                     bool changed = idx < orig.size() && d[idx] != orig[idx];
-                    if (changed) ImGui::PushStyleColor(ImGuiCol_Text, kMod);
+                    bool target  = (long)idx == a.hexTarget;
+                    bool colored = changed || target;
+                    if (colored) ImGui::PushStyleColor(ImGuiCol_Text, target ? kAccent : kMod);
                     char cell[4]; snprintf(cell, sizeof cell, "%02X", d[idx]);
                     ImGui::TextUnformatted(cell);
-                    if (changed) ImGui::PopStyleColor();
-                    if (editable && ImGui::IsItemClicked()) a.editByte = (int)idx;
+                    if (colored) ImGui::PopStyleColor();
+                    if (editable && ImGui::IsItemClicked()) { a.editByte = (int)idx; a.hexTarget = (long)idx; }
                 }
                 ImGui::PopID();
             }
@@ -542,6 +629,55 @@ static void drawFileTree(App& a) {
     ImGui::Separator();
     if (!a.fsMounted) { ImGui::TextDisabled("No FAT12 filesystem on this image."); return; }
 
+    // Directory edit toolbar.
+    if (ImGui::Button("Add file...")) {
+        std::string p = openDialog("Add file to disk", {"*.*"}, "All files");
+        if (!p.empty()) {
+            auto data = slurp(p); std::string err;
+            if (a.fs.createFile(a.cwd, fileBaseName(p), data, &err)) {
+                a.status = "Added " + fileBaseName(p) + " (" + std::to_string(data.size()) + " B)"; refreshListing(a);
+            } else a.status = "Add failed: " + err;
+        }
+    }
+    help("Copy a file from your PC into the current directory as a new 8.3 entry (grows the FAT as needed).");
+    ImGui::SameLine();
+    if (ImGui::Button("New folder")) { a.nameBuf[0] = 0; a.openNewFolder = true; }
+    ImGui::SameLine();
+    bool canRename = a.selected >= 0 && !a.listing[a.selected].isVolume();
+    if (!canRename) ImGui::BeginDisabled();
+    if (ImGui::Button("Rename")) {
+        strncpy(a.nameBuf, a.listing[a.selected].name.c_str(), sizeof a.nameBuf - 1);
+        a.nameBuf[sizeof a.nameBuf - 1] = 0; a.openRename = true;
+    }
+    if (!canRename) ImGui::EndDisabled();
+    ImGui::Separator();
+
+    // Modals.
+    if (a.openNewFolder) { ImGui::OpenPopup("New folder"); a.openNewFolder = false; }
+    if (ImGui::BeginPopupModal("New folder", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::InputText("name (8.3)", a.nameBuf, sizeof a.nameBuf);
+        if (ImGui::Button("Create") && a.nameBuf[0]) {
+            std::string err;
+            if (a.fs.makeDir(a.cwd, a.nameBuf, &err)) { a.status = "Created folder " + std::string(a.nameBuf); refreshListing(a); }
+            else a.status = "New folder failed: " + err;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine(); if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+    if (a.openRename) { ImGui::OpenPopup("Rename"); a.openRename = false; }
+    if (ImGui::BeginPopupModal("Rename", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::InputText("new name (8.3)", a.nameBuf, sizeof a.nameBuf);
+        if (ImGui::Button("Rename") && a.nameBuf[0] && a.selected >= 0) {
+            std::string err;
+            if (a.fs.renameEntry(a.listing[a.selected], a.nameBuf, &err)) { a.status = "Renamed to " + std::string(a.nameBuf); refreshListing(a); }
+            else a.status = "Rename failed: " + err;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine(); if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
     ImGui::TextColored(kAccent, "%s", a.cwd.c_str());
     if (a.cwd != "/") {
         if (ImGui::Selectable(".. (up)")) {
@@ -587,6 +723,7 @@ static void drawFileToolbar(App& a) {
     const DirEntry& e = a.listing[a.selected];
     ImGui::TextColored(kAccent, "%s", a.selName.c_str());
     ImGui::SameLine(); ImGui::TextDisabled("(%zu bytes, %s)", a.selData.size(), typeName(a.selType));
+    if (!a.selData.empty()) { ImGui::SameLine(); ImGui::TextDisabled(" CRC32 %08X", crc32(a.selData)); }
     if (a.hexDirty || a.textDirty) { ImGui::SameLine(); ImGui::TextColored(kMod, "  * unsaved edits"); }
     ImGui::Separator();
     if (ImGui::Button("Export to file...")) {
@@ -833,6 +970,26 @@ static void drawManual(App& a) {
     ImGui::End();
 }
 
+static void drawFsck(App& a) {
+    if (!a.showFsck) return;
+    ImGui::SetNextWindowSize(ImVec2(540, 360), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Filesystem check", &a.showFsck)) {
+        ImGui::Text("Used by files : %ld clusters", a.fsck.usedByFiles);
+        ImGui::Text("Unreferenced  : %ld  (RAW game data or lost clusters)", a.fsck.unreferenced);
+        ImGui::Text("Free          : %ld clusters", a.fsck.freeClusters);
+        ImGui::Separator();
+        if (a.fsck.issues.empty())
+            ImGui::TextColored(kGreen, "Integrity OK - no cross-links or broken chains.");
+        else {
+            ImGui::TextColored(kWarn, "%zu issue(s):", a.fsck.issues.size());
+            ImGui::BeginChild("iss", ImVec2(0, 0), true);
+            for (auto& i : a.fsck.issues) ImGui::TextWrapped("- %s", i.c_str());
+            ImGui::EndChild();
+        }
+    }
+    ImGui::End();
+}
+
 static void drawAbout(App& a) {
     if (!a.showAbout) return;
     ImGui::SetNextWindowSize(ImVec2(420, 220), ImGuiCond_FirstUseEver);
@@ -941,9 +1098,15 @@ int main(int argc, char** argv) {
                         {"*.dsk","*.dmk","*.di","*.rom","*.mx1","*.mx2","*.cas"}, "MSX media");
                     if (!p.empty()) openPath(app, p);
                 }
+                if (ImGui::BeginMenu("New blank disk")) {
+                    if (ImGui::MenuItem("720 KB (double-sided)")) newBlankDisk(app, 1440);
+                    if (ImGui::MenuItem("360 KB (single-sided)")) newBlankDisk(app, 720);
+                    ImGui::EndMenu();
+                }
                 bool disk = app.mode == Mode::Disk;
                 if (ImGui::MenuItem("Save image", "Ctrl+S", false, disk)) saveImage(app);
                 if (ImGui::MenuItem("Save image as...", "Ctrl+Shift+S", false, disk)) saveImageAs(app);
+                ImGui::MenuItem("Keep .bak on save", nullptr, &app.backupOnSave);
                 ImGui::Separator();
                 if (ImGui::MenuItem("Close", nullptr, false, app.mode != Mode::None)) {
                     app.mode = Mode::None; app.imagePath.clear(); clearSelection(app);
@@ -959,6 +1122,15 @@ int main(int argc, char** argv) {
                     std::string err;
                     if (app.fs.deleteFile(app.listing[app.selected], &err)) refreshListing(app);
                 }
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Tools")) {
+                bool diskFs = app.mode == Mode::Disk && app.fsMounted;
+                if (ImGui::MenuItem("Check filesystem (fsck)", nullptr, false, diskFs)) {
+                    app.fsck = app.fs.verify(); app.showFsck = true;
+                }
+                if (ImGui::MenuItem("Open in openMSX", nullptr, false, app.mode == Mode::Disk))
+                    openInEmulator(app);
                 ImGui::EndMenu();
             }
             if (ImGui::BeginMenu("Help")) {
@@ -1022,6 +1194,7 @@ int main(int argc, char** argv) {
 
         drawManual(app);
         drawAbout(app);
+        drawFsck(app);
 
         ImGui::Render();
         glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);

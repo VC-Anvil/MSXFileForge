@@ -17,6 +17,7 @@
 #include "../core/msxfile.h"
 #include "../core/rom.h"
 #include "../core/cas.h"
+#include "../core/util.h"
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -278,6 +279,112 @@ static int cmd_rawput(int argc, char** argv) {
     return ok ? 0 : 8;
 }
 
+static std::string baseName(const std::string& p) {
+    size_t s = p.find_last_of("/\\");
+    return s == std::string::npos ? p : p.substr(s + 1);
+}
+
+static int cmd_format(int argc, char** argv) {
+    if (argc < 3) { fprintf(stderr, "need <out.dsk> [360|720]\n"); return 1; }
+    int kb = (argc >= 4) ? atoi(argv[3]) : 720;
+    auto img = formatBlankImage(kb == 360 ? 720 : 1440);
+    FILE* f = fopen(argv[2], "wb"); if (!f) { fprintf(stderr, "cannot write\n"); return 2; }
+    fwrite(img.data(), 1, img.size(), f); fclose(f);
+    printf("formatted blank %dKB image -> %s (%zu bytes)\n", kb, argv[2], img.size());
+    return 0;
+}
+
+static int cmd_add(int argc, char** argv) {
+    // add <image> <hostfile> [/DIR] [NAME]
+    if (argc < 4) { fprintf(stderr, "need <image> <hostfile> [/DIR] [NAME]\n"); return 1; }
+    DiskImage dk; Fat12 fs; int rc = mountDisk(argv[2], dk, fs); if (rc) return rc;
+    std::string dir = (argc >= 5) ? argv[4] : "/";
+    std::string name = (argc >= 6) ? argv[5] : baseName(argv[3]);
+    auto data = slurp(argv[3]);
+    std::string err;
+    if (!fs.createFile(dir, name, data, &err)) { fprintf(stderr, "add: %s\n", err.c_str()); return 6; }
+    if (!dk.save(argv[2], &err)) { fprintf(stderr, "save: %s\n", err.c_str()); return 7; }
+    printf("added %s (%zu bytes) as %s%s\n", argv[3], data.size(),
+           dir.c_str(), name.c_str());
+    return 0;
+}
+
+static int cmd_rename(int argc, char** argv) {
+    if (argc < 5) { fprintf(stderr, "need <image> <OLD> <NEW>\n"); return 1; }
+    DiskImage dk; Fat12 fs; int rc = mountDisk(argv[2], dk, fs); if (rc) return rc;
+    auto root = fs.list("/", false);
+    DirEntry* e = nullptr;
+    std::string want = argv[3]; for (auto& c : want) c = (char)toupper((unsigned char)c);
+    for (auto& d : root) { std::string nm=d.name; for(auto&c:nm)c=(char)toupper((unsigned char)c);
+        if (nm==want){e=&d;break;} }
+    if (!e) { fprintf(stderr, "not found\n"); return 4; }
+    std::string err;
+    if (!fs.renameEntry(*e, argv[4], &err)) { fprintf(stderr, "rename: %s\n", err.c_str()); return 6; }
+    if (!dk.save(argv[2], &err)) return 7;
+    printf("renamed %s -> %s\n", argv[3], argv[4]); return 0;
+}
+
+static int cmd_mkdir(int argc, char** argv) {
+    if (argc < 4) { fprintf(stderr, "need <image> <NAME> [/PARENT]\n"); return 1; }
+    DiskImage dk; Fat12 fs; int rc = mountDisk(argv[2], dk, fs); if (rc) return rc;
+    std::string parent = (argc >= 5) ? argv[4] : "/";
+    std::string err;
+    if (!fs.makeDir(parent, argv[3], &err)) { fprintf(stderr, "mkdir: %s\n", err.c_str()); return 6; }
+    if (!dk.save(argv[2], &err)) return 7;
+    printf("created dir %s in %s\n", argv[3], parent.c_str()); return 0;
+}
+
+static int cmd_crc(int argc, char** argv) {
+    if (argc < 3) { fprintf(stderr, "need <image> [FILE]\n"); return 1; }
+    if (argc >= 4) {
+        DiskImage dk; Fat12 fs; int rc = mountDisk(argv[2], dk, fs); if (rc) return rc;
+        auto root = fs.list("/", false);
+        const DirEntry* e = findEntry(fs, argv[3], root);
+        if (!e) { fprintf(stderr, "not found\n"); return 4; }
+        auto d = fs.readFile(*e);
+        printf("%08X  %s  (%zu bytes)\n", crc32(d), argv[3], d.size());
+    } else {
+        auto d = slurp(argv[2]);
+        printf("%08X  %s  (%zu bytes)\n", crc32(d), argv[2], d.size());
+    }
+    return 0;
+}
+
+static int cmd_fsck(const char* img) {
+    DiskImage dk; Fat12 fs; std::string err;
+    if (!dk.load(img, &err)) { fprintf(stderr, "%s\n", err.c_str()); return 2; }
+    if (!fs.mount(dk, &err)) { fprintf(stderr, "mount: %s\n", err.c_str()); return 3; }
+    Fat12::FsCheck c = fs.verify();
+    printf("used-by-files: %ld clusters   unreferenced(RAW/lost): %ld   free: %ld\n",
+           c.usedByFiles, c.unreferenced, c.freeClusters);
+    if (c.issues.empty()) printf("FAT integrity: OK (no cross-links or bad chains)\n");
+    else { printf("issues (%zu):\n", c.issues.size());
+        for (auto& i : c.issues) printf("  - %s\n", i.c_str()); }
+    return c.issues.empty() ? 0 : 1;
+}
+
+static int cmd_diff(int argc, char** argv) {
+    if (argc < 4) { fprintf(stderr, "need <imageA> <imageB>\n"); return 1; }
+    DiskImage a, b; Fat12 fa, fb; int rc;
+    if ((rc = mountDisk(argv[2], a, fa))) return rc;
+    if ((rc = mountDisk(argv[3], b, fb))) return rc;
+    auto la = fa.list("/", false), lb = fb.list("/", false);
+    auto findIn = [](std::vector<DirEntry>& l, const std::string& n) -> DirEntry* {
+        for (auto& e : l) if (e.name == n && !e.isDir()) return &e; return nullptr; };
+    printf("--- %s  vs  +++ %s\n", baseName(argv[2]).c_str(), baseName(argv[3]).c_str());
+    int same=0, diff=0, onlyA=0, onlyB=0;
+    for (auto& e : la) { if (e.isDir()||e.isVolume()) continue;
+        DirEntry* o = findIn(lb, e.name);
+        if (!o) { printf("  - only in A: %s\n", e.name.c_str()); onlyA++; }
+        else { uint32_t ca=crc32(fa.readFile(e)), cb=crc32(fb.readFile(*o));
+            if (ca!=cb) { printf("  * differs : %s (%08X vs %08X)\n", e.name.c_str(), ca, cb); diff++; }
+            else same++; } }
+    for (auto& e : lb) { if (e.isDir()||e.isVolume()) continue;
+        if (!findIn(la, e.name)) { printf("  + only in B: %s\n", e.name.c_str()); onlyB++; } }
+    printf("summary: %d same, %d differ, %d only-A, %d only-B\n", same, diff, onlyA, onlyB);
+    return 0;
+}
+
 static int cmd_rominfo(const char* path) {
     auto d = slurp(path);
     if (d.empty()) { fprintf(stderr, "cannot read %s\n", path); return 2; }
@@ -326,6 +433,13 @@ int main(int argc, char** argv) {
     if (cmd == "raw")     return cmd_raw(argc, argv);
     if (cmd == "carve")   return cmd_carve(argc, argv);
     if (cmd == "rawput")  return cmd_rawput(argc, argv);
+    if (cmd == "format")  return cmd_format(argc, argv);
+    if (cmd == "add")     return cmd_add(argc, argv);
+    if (cmd == "rename")  return cmd_rename(argc, argv);
+    if (cmd == "mkdir")   return cmd_mkdir(argc, argv);
+    if (cmd == "crc")     return cmd_crc(argc, argv);
+    if (cmd == "fsck")    return cmd_fsck(argv[2]);
+    if (cmd == "diff")    return cmd_diff(argc, argv);
     if (cmd == "rominfo") return cmd_rominfo(argv[2]);
     if (cmd == "cas")     return cmd_cas(argv[2]);
     fprintf(stderr, "unknown command: %s\n", cmd.c_str());
