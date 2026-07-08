@@ -18,6 +18,7 @@
 #include "../core/rom.h"
 #include "../core/cas.h"
 #include "../core/util.h"
+#include "../core/tape.h"
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -385,6 +386,24 @@ static int cmd_diff(int argc, char** argv) {
     return 0;
 }
 
+static int cmd_tape(int argc, char** argv, const char* mode) {
+    // <mode> <in> <out> [-2]
+    if (argc < 4) { fprintf(stderr, "need <in> <out> [-2]\n"); return 1; }
+    int baud = (argc >= 5 && !strcmp(argv[4], "-2")) ? 2400 : 1200;
+    auto in = slurp(argv[2]);
+    if (in.empty()) { fprintf(stderr, "cannot read %s\n", argv[2]); return 2; }
+    std::vector<uint8_t> out; std::string err;
+    if      (!strcmp(mode, "cas2wav")) out = casToWav(in, baud);
+    else if (!strcmp(mode, "cas2tsx")) out = casToTsx(in, baud);
+    else if (!strcmp(mode, "tsx2cas")) out = tsxToCas(in, &err);
+    else if (!strcmp(mode, "wav2cas")) out = wavToCas(in, &err);
+    if (!err.empty()) fprintf(stderr, "warning: %s\n", err.c_str());
+    FILE* f = fopen(argv[3], "wb"); if (!f) { fprintf(stderr, "cannot write\n"); return 3; }
+    fwrite(out.data(), 1, out.size(), f); fclose(f);
+    printf("%s: %zu -> %zu bytes -> %s\n", mode, in.size(), out.size(), argv[3]);
+    return 0;
+}
+
 static int cmd_rominfo(const char* path) {
     auto d = slurp(path);
     if (d.empty()) { fprintf(stderr, "cannot read %s\n", path); return 2; }
@@ -440,6 +459,8 @@ int main(int argc, char** argv) {
     if (cmd == "crc")     return cmd_crc(argc, argv);
     if (cmd == "fsck")    return cmd_fsck(argv[2]);
     if (cmd == "diff")    return cmd_diff(argc, argv);
+    if (cmd == "cas2wav" || cmd == "cas2tsx" || cmd == "tsx2cas" || cmd == "wav2cas")
+        return cmd_tape(argc, argv, cmd.c_str());
     if (cmd == "rominfo") return cmd_rominfo(argv[2]);
     if (cmd == "cas")     return cmd_cas(argv[2]);
     fprintf(stderr, "unknown command: %s\n", cmd.c_str());

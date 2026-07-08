@@ -40,6 +40,7 @@
 #include "../core/rom.h"
 #include "../core/cas.h"
 #include "../core/util.h"
+#include "../core/tape.h"
 
 #include <string>
 #include <vector>
@@ -221,6 +222,20 @@ static void openPath(App& a, const std::string& path) {
         if (a.blob.empty()) { a.status = "Cannot read CAS: " + path; return; }
         a.cas = parseCas(a.blob); a.mode = Mode::Cas;
         a.status = "CAS loaded (" + std::to_string(a.cas.size()) + " blocks)"; return;
+    }
+    if (hasExt(path, ".tsx") || hasExt(path, ".tzx")) {
+        auto t = slurp(path); std::string err;
+        a.blob = tsxToCas(t, &err);
+        a.cas = parseCas(a.blob); a.mode = Mode::Cas;
+        a.status = a.blob.empty() ? ("TSX decode: " + err)
+            : ("TSX loaded -> " + std::to_string(a.cas.size()) + " cassette block(s)"); return;
+    }
+    if (hasExt(path, ".wav")) {
+        auto w = slurp(path); std::string err;
+        a.blob = wavToCas(w, &err);
+        a.cas = parseCas(a.blob); a.mode = Mode::Cas;
+        a.status = a.blob.empty() ? ("WAV decode: " + err)
+            : ("WAV decoded -> " + std::to_string(a.cas.size()) + " cassette block(s)  (best-effort)"); return;
     }
     std::string err;
     if (!a.disk.load(path, &err)) { a.status = "Load error: " + err; return; }
@@ -868,7 +883,26 @@ static void drawRom(App& a) {
 }
 
 static void drawCas(App& a) {
-    ImGui::TextColored(kAccent, "CAS  %s  (%zu blocks)", a.imagePath.c_str(), a.cas.size());
+    ImGui::TextColored(kAccent, "Cassette  %s  (%zu blocks)", a.imagePath.c_str(), a.cas.size());
+    // Tape conversion exports (operate on the reconstructed .cas byte stream).
+    if (ImGui::Button("Export as WAV...")) {
+        auto w = casToWav(a.blob);
+        std::string p = saveDialog("Export tape as WAV", "tape.wav", {"*.wav"}, "WAV audio");
+        if (!p.empty()) { dump(p, w.data(), w.size()); a.status = "Exported WAV (" + std::to_string(w.size()) + " B) -> " + p; }
+    }
+    help("Render the cassette to playable KCS audio (8-bit mono 43200 Hz) - load it on a real MSX or an emulator's cassette input.");
+    ImGui::SameLine();
+    if (ImGui::Button("Export as TSX...")) {
+        auto t = casToTsx(a.blob);
+        std::string p = saveDialog("Export tape as TSX", "tape.tsx", {"*.tsx"}, "TSX tape");
+        if (!p.empty()) { dump(p, t.data(), t.size()); a.status = "Exported TSX -> " + p; }
+    }
+    help("Save as TSX (TZX family with MSX KCS 0x4B blocks) - the standard MSX tape-preservation format.");
+    ImGui::SameLine();
+    if (ImGui::Button("Export as CAS...")) {
+        std::string p = saveDialog("Export as CAS", "tape.cas", {"*.cas"}, "MSX cassette");
+        if (!p.empty()) { dump(p, a.blob.data(), a.blob.size()); a.status = "Exported CAS -> " + p; }
+    }
     ImGui::Separator();
     if (ImGui::BeginTable("cas", 4, ImGuiTableFlags_RowBg|ImGuiTableFlags_Borders)) {
         ImGui::TableSetupColumn("Offset"); ImGui::TableSetupColumn("Kind");
@@ -1072,7 +1106,7 @@ int main(int argc, char** argv) {
         bool ctrl = io.KeyCtrl;
         if (ctrl && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
             std::string p = openDialog("Open MSX media",
-                {"*.dsk","*.dmk","*.di","*.rom","*.mx1","*.mx2","*.cas"}, "MSX media");
+                {"*.dsk","*.dmk","*.di","*.rom","*.mx1","*.mx2","*.cas","*.tsx","*.tzx","*.wav"}, "MSX media");
             if (!p.empty()) openPath(app, p);
         }
         if (ctrl && ImGui::IsKeyPressed(ImGuiKey_S, false) && app.mode == Mode::Disk) {
@@ -1095,7 +1129,7 @@ int main(int argc, char** argv) {
             if (ImGui::BeginMenu("File")) {
                 if (ImGui::MenuItem("Open...", "Ctrl+O")) {
                     std::string p = openDialog("Open MSX media",
-                        {"*.dsk","*.dmk","*.di","*.rom","*.mx1","*.mx2","*.cas"}, "MSX media");
+                        {"*.dsk","*.dmk","*.di","*.rom","*.mx1","*.mx2","*.cas","*.tsx","*.tzx","*.wav"}, "MSX media");
                     if (!p.empty()) openPath(app, p);
                 }
                 if (ImGui::BeginMenu("New blank disk")) {
@@ -1186,7 +1220,7 @@ int main(int argc, char** argv) {
             ImGui::Spacing();
             ImGui::BulletText("Disk: .dsk, raw, .dmk  (protected/RAW aware, FAT12 read/write)");
             ImGui::BulletText("Cartridge: .rom (.mx1/.mx2)  -  mapper detection");
-            ImGui::BulletText("Tape: .cas  -  block layout");
+            ImGui::BulletText("Tape: .cas / .tsx / .wav  -  view + convert between them");
             ImGui::Spacing();
             ImGui::TextDisabled("See Help > Manual (F1) for what each panel does.");
         }

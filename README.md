@@ -25,7 +25,7 @@ It handles the whole MSX file stack:
 | **Analysis / integrity** | CRC32 of files and images, a **filesystem check** (cross-links, broken chains, lost vs RAW clusters), and a **disk diff** (files only-in-A / only-in-B / differing by CRC). Optional `.bak` backup on save. |
 | **MSX files** | Type detection (tokenized BASIC `0xFF`, BLOAD binary `0xFE`, ASCII, data), a full **BASIC detokenizer** and an inverse **tokenizer** (edit a listing as text and save it back tokenized). Handles standard + `0xFF`-extended tokens, hex/oct/int/BCD-float constants, line references, string & REM literals. |
 | **Cartridge ROMs** | Size / page count, `AB` header + entry points (INIT/STATEMENT/DEVICE/TEXT), and **mapper detection** (None / Konami / Konami SCC / ASCII8 / ASCII16) via the openMSX-style write-target heuristic. |
-| **Cassette** | `.cas` block layout: header sync, ASCII / Binary / Tokenized-BASIC file blocks with filenames. |
+| **Cassette** | `.cas` block layout (sync headers, ASCII / Binary / Tokenized-BASIC files), plus **conversion between `.cas`, `.tsx` and `.wav`**: export playable **WAV** audio (Kansas-City-Standard FSK, cas2wav-compatible), read/write **TSX** (TZX family with MSX `0x4B` KCS blocks), and decode a clean WAV recording back to `.cas`. |
 
 ## Layout
 
@@ -92,6 +92,10 @@ msxforge mkdir   <image> <NAME> [/PARENT]
 msxforge crc     <image> [FILE]       CRC32 of a file or the whole image
 msxforge fsck    <image>              filesystem integrity check
 msxforge diff    <imageA> <imageB>    compare two disks
+msxforge cas2wav <in.cas> <out.wav> [-2]   render tape to WAV (-2 = 2400 baud)
+msxforge cas2tsx <in.cas> <out.tsx> [-2]   convert to TSX (TZX + MSX 0x4B KCS)
+msxforge tsx2cas <in.tsx> <out.cas>        extract tape data from TSX
+msxforge wav2cas <in.wav> <out.cas>        decode a (clean) WAV back to CAS
 msxforge rominfo <rom>
 msxforge cas     <cas>
 ```

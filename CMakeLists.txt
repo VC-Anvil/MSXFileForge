@@ -10,7 +10,7 @@ endif()
 
 # --- core library (portable, no GUI deps) ---
 add_library(msxcore STATIC
-  core/disk_image.cpp core/fat12.cpp core/msxfile.cpp core/rom.cpp core/cas.cpp core/util.cpp)
+  core/disk_image.cpp core/fat12.cpp core/msxfile.cpp core/rom.cpp core/cas.cpp core/util.cpp core/tape.cpp)
 target_include_directories(msxcore PUBLIC core)
 
 # --- CLI ---
