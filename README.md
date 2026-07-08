@@ -54,6 +54,12 @@ produced by CI on every push — grab them from the **Actions** tab (artifacts
 Native file dialogs on Linux use **zenity** or **kdialog** at runtime (install
 one if your desktop lacks it).
 
+The release binaries link the system SDL2 rather than bundling it, to stay
+small and use your distro's up-to-date library. A fully self-contained
+**AppImage** (Linux) or **.app** bundle (macOS) is intentionally *not* shipped —
+if you want one, it is straightforward to build from these binaries and is left
+to interested packagers.
+
 **Windows** — SDL2 is bundled, so nothing to install:
 
 ```sh
