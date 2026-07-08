@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alonso (GS·RUN). MSXFileForge.
+// Free software under the GNU GPL v3 (or later) - see LICENSE. Modified
+// versions must be distributed under the same license.
 #include "rom.h"
 
 namespace msx {

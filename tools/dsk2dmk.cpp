@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alonso (GS·RUN). MSXFileForge.
+// Free software under the GNU GPL v3 (or later) - see LICENSE. Modified
+// versions must be distributed under the same license.
 // dsk2dmk - re-encode a flat .dsk into a DMK track image.
 //
 // Used to exercise MSXFileForge's DMK reader end-to-end: a disk read through a

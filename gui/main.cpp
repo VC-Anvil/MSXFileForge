@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alonso (GS·RUN). MSXFileForge.
+// Free software under the GNU GPL v3 (or later) - see LICENSE. Modified
+// versions must be distributed under the same license.
 // MSXFileForge - native GUI (Dear ImGui + SDL2 + OpenGL3).
 //
 // A real editor for MSX media: open a disk image (.dsk / raw / .dmk), cartridge

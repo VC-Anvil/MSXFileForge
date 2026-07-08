@@ -99,7 +99,19 @@ detokenize, and delete frees clusters and drops the entry.
   writing back into a `.dmk` container are the next milestones (disk writes
   target flat `.dsk`/raw today).
 
-## License / provenance
+## License
 
-Bundles Dear ImGui (MIT) and SDL2 (zlib). FAT12 handling is a clean C++ rewrite
-informed by the sibling `dsk2rom` FAT tooling.
+MSXFileForge is **free software** licensed under the **GNU General Public
+License v3.0 or later** (see [`LICENSE`](LICENSE)). You may use and redistribute
+it freely; **any modified version you distribute must be released under the same
+GPL-3.0-or-later license** (copyleft / share-alike).
+
+Bundled third-party components keep their own permissive, GPL-compatible
+licenses: **Dear ImGui** (MIT) and **SDL2** (zlib). FAT12 handling is a clean
+C++ rewrite informed by the sibling `dsk2rom` FAT tooling.
+
+    Copyright (C) 2026 Alonso (GS·RUN)
+    This program is free software: you can redistribute it and/or modify it
+    under the terms of the GNU General Public License as published by the Free
+    Software Foundation, either version 3 of the License, or (at your option)
+    any later version. This program is distributed WITHOUT ANY WARRANTY.
