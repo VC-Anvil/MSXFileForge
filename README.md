@@ -1,8 +1,11 @@
 # MSXFileForge
 
+[![build](https://github.com/GS-RUN/MSXFileForge/actions/workflows/build.yml/badge.svg)](https://github.com/GS-RUN/MSXFileForge/actions/workflows/build.yml)
+[![license: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
+
 A native (C++/Dear ImGui) editor and inspector for **MSX** files, with first-class
 support for reading **protected** and **RAW** disk images that a plain `.dsk`
-cannot represent.
+cannot represent. Runs on **Windows, Linux and macOS**.
 
 ![Editing a tokenized BASIC file straight off an MSX disk](assets/screenshot.png)
 
@@ -33,14 +36,32 @@ tools/    dsk2dmk — re-encodes a .dsk into a DMK track image (used for testing
 libs/     vendored Dear ImGui 1.92.7 + SDL2 (self-contained)
 ```
 
-## Build (Windows, MinGW-w64)
+## Build
+
+Cross-platform (Windows / Linux / macOS). Pre-built binaries for all three are
+produced by CI on every push — grab them from the **Actions** tab (artifacts
+`msxforge-linux` / `msxforge-macos` / `msxforge-windows`).
+
+**Linux / macOS** — needs a C++17 compiler, CMake and SDL2:
 
 ```sh
-./build.sh          # or: cmake -B build -G "MinGW Makefiles" && cmake --build build
+# Debian/Ubuntu: sudo apt install -y build-essential cmake libsdl2-dev libgl1-mesa-dev
+# Fedora:        sudo dnf install -y gcc-c++ cmake SDL2-devel
+# macOS:         brew install cmake sdl2
+./build-unix.sh            # or: cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 ```
 
-Produces `build/msxforge.exe`, `build/msxforge-gui.exe`, `build/dsk2dmk.exe`.
-`SDL2.dll` is copied next to the GUI exe.
+Native file dialogs on Linux use **zenity** or **kdialog** at runtime (install
+one if your desktop lacks it).
+
+**Windows** — SDL2 is bundled, so nothing to install:
+
+```sh
+./build.sh                # MinGW-w64 (g++), links the bundled SDL2.dll
+# or with MSVC:  cmake -B build && cmake --build build --config Release
+```
+
+All targets produce `msxforge` (CLI), `msxforge-gui` (GUI) and `dsk2dmk`.
 
 ## CLI usage
 
@@ -115,8 +136,9 @@ it freely; **any modified version you distribute must be released under the same
 GPL-3.0-or-later license** (copyleft / share-alike).
 
 Bundled third-party components keep their own permissive, GPL-compatible
-licenses: **Dear ImGui** (MIT) and **SDL2** (zlib). FAT12 handling is a clean
-C++ rewrite informed by the sibling `dsk2rom` FAT tooling.
+licenses: **Dear ImGui** (MIT), **SDL2** (zlib), **tinyfiledialogs** (zlib) and
+**stb_image_write** (public domain). FAT12 handling is a clean C++ rewrite
+informed by the sibling `dsk2rom` FAT tooling.
 
     Copyright (C) 2026 Alonso (GS·RUN)
     This program is free software: you can redistribute it and/or modify it

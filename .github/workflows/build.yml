@@ -1,0 +1,57 @@
+name: build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  name: linux }
+          - { os: macos-latest,   name: macos }
+          - { os: windows-latest, name: windows }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential libsdl2-dev libgl1-mesa-dev
+
+      - name: Install deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install sdl2
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release -j 2
+
+      - name: Stage artifacts (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir dist
+          cp build/msxforge build/msxforge-gui build/dsk2dmk dist/
+          cp README.md LICENSE dist/
+
+      - name: Stage artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir dist
+          cp build/Release/msxforge.exe build/Release/msxforge-gui.exe build/Release/dsk2dmk.exe dist/
+          cp libs/SDL2/lib/SDL2.dll dist/
+          cp README.md LICENSE dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: msxforge-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error

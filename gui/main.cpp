@@ -9,21 +9,30 @@
 // (BASIC is detokenized for editing and re-tokenized on save); save changes back
 // into the image and write the image out. Native Open/Save dialogs, an in-app
 // manual, and a protected/RAW sector inspector.
+#ifndef SDL_MAIN_HANDLED
 #define SDL_MAIN_HANDLED
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
+#endif
 #include <SDL.h>
 #include <SDL_opengl.h>
-#include <SDL_syswm.h>
-#include <windows.h>
-#include <commdlg.h>
-#include <shellapi.h>
+#if defined(_WIN32)
+  #ifndef WIN32_LEAN_AND_MEAN
+  #define WIN32_LEAN_AND_MEAN
+  #endif
+  #ifndef NOMINMAX
+  #define NOMINMAX
+  #endif
+  #include <windows.h>
+  #include <shellapi.h>
+#endif
 
 #include "imgui.h"
 #include "backends/imgui_impl_sdl2.h"
 #include "backends/imgui_impl_opengl3.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "../libs/stb_image_write.h"
+#include "../libs/tinyfiledialogs.h"
+
+#include <initializer_list>
 
 #include "../core/disk_image.h"
 #include "../core/fat12.h"
@@ -81,7 +90,6 @@ struct App {
     char pathInput[1024] = {0};
     bool showManual = false;
     bool showAbout = false;
-    HWND hwnd = nullptr;
 };
 
 // ---- IO helpers -----------------------------------------------------------
@@ -104,7 +112,15 @@ static bool hasExt(const std::string& p, const char* e) {
     for (auto& c : t) c = (char)tolower((unsigned char)c);
     return t == e;
 }
-static void openUrl(const char* url) { ShellExecuteA(nullptr, "open", url, nullptr, nullptr, SW_SHOWNORMAL); }
+static void openUrl(const char* url) {
+#if defined(_WIN32)
+    ShellExecuteA(nullptr, "open", url, nullptr, nullptr, SW_SHOWNORMAL);
+#elif defined(__APPLE__)
+    std::string c = std::string("open '") + url + "' >/dev/null 2>&1 &"; (void)!system(c.c_str());
+#else
+    std::string c = std::string("xdg-open '") + url + "' >/dev/null 2>&1 &"; (void)!system(c.c_str());
+#endif
+}
 
 // Capture the GL framebuffer to a PNG (used for the README screenshot). Done
 // from inside the GL context, so it is immune to the black-frame problem GDI
@@ -121,24 +137,21 @@ static void saveScreenshot(SDL_Window* win, const char* path) {
     stbi_write_png(path, w, h, 4, flip.data(), w * 4);
 }
 
-static std::string openDialog(HWND owner, const char* filter) {
-    char file[1024] = "";
-    OPENFILENAMEA o; memset(&o, 0, sizeof o);
-    o.lStructSize = sizeof o; o.hwndOwner = owner;
-    o.lpstrFilter = filter; o.lpstrFile = file; o.nMaxFile = sizeof file;
-    o.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
-    return GetOpenFileNameA(&o) ? std::string(file) : std::string();
+// Cross-platform native file dialogs via tinyfiledialogs (comdlg32 on Windows,
+// zenity/kdialog on Linux, AppleScript on macOS).
+static std::string openDialog(const char* title, std::initializer_list<const char*> pats,
+                              const char* desc) {
+    std::vector<const char*> v(pats);
+    const char* r = tinyfd_openFileDialog(title, "", (int)v.size(),
+                                          v.empty() ? nullptr : v.data(), desc, 0);
+    return r ? std::string(r) : std::string();
 }
-static std::string saveDialog(HWND owner, const char* filter, const char* defExt,
-                              const char* suggested = nullptr) {
-    char file[1024] = "";
-    if (suggested) strncpy(file, suggested, sizeof file - 1);
-    OPENFILENAMEA o; memset(&o, 0, sizeof o);
-    o.lStructSize = sizeof o; o.hwndOwner = owner;
-    o.lpstrFilter = filter; o.lpstrFile = file; o.nMaxFile = sizeof file;
-    o.lpstrDefExt = defExt;
-    o.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
-    return GetSaveFileNameA(&o) ? std::string(file) : std::string();
+static std::string saveDialog(const char* title, const char* suggested,
+                              std::initializer_list<const char*> pats, const char* desc) {
+    std::vector<const char*> v(pats);
+    const char* r = tinyfd_saveFileDialog(title, suggested ? suggested : "", (int)v.size(),
+                                          v.empty() ? nullptr : v.data(), desc);
+    return r ? std::string(r) : std::string();
 }
 
 // ---- Model ops ------------------------------------------------------------
@@ -219,9 +232,8 @@ static void saveFileToImage(App& a, const std::vector<uint8_t>& bytes) {
 }
 
 static void saveImageAs(App& a) {
-    std::string p = saveDialog(a.hwnd,
-        "MSX disk image\0*.dsk\0DMK track image\0*.dmk\0All files\0*.*\0",
-        "dsk", a.imagePath.c_str());
+    std::string p = saveDialog("Save disk image as", a.imagePath.c_str(),
+                               {"*.dsk", "*.dmk"}, "MSX disk image");
     if (p.empty()) return;
     std::string err;
     if (a.disk.save(p, &err)) { a.disk.clearDirty(); a.imagePath = p; a.status = "Image saved: " + p; }
@@ -403,14 +415,14 @@ static void drawRawMap(App& a) {
 
     if (ImGui::Button("Export RAW data (unnamed)...")) {
         auto d = a.fs.extractRawUnnamed();
-        std::string p = saveDialog(a.hwnd, "Binary\0*.bin\0All files\0*.*\0", "bin", "raw_data.bin");
+        std::string p = saveDialog("Export RAW data", "raw_data.bin", {"*.bin"}, "Binary");
         if (!p.empty()) { dump(p, d.data(), d.size());
             a.status = "Exported " + std::to_string(d.size()) + " bytes of RAW data -> " + p; }
     }
     help("Concatenate every allocated-but-unnamed cluster (the uncatalogued game data) and save it to your PC.");
     ImGui::SameLine();
     if (ImGui::Button("Import RAW data (replace)...")) {
-        std::string p = openDialog(a.hwnd, "Binary\0*.bin\0All files\0*.*\0");
+        std::string p = openDialog("Import RAW data", {"*.bin", "*.*"}, "Binary");
         if (!p.empty()) {
             auto d = slurp(p);
             long wrote = 0; std::string err;
@@ -424,7 +436,7 @@ static void drawRawMap(App& a) {
          "Same-size data restores byte-for-byte; larger data is truncated to the RAW capacity.");
     ImGui::SameLine();
     if (ImGui::Button("Export whole image...")) {
-        std::string p = saveDialog(a.hwnd, "All files\0*.*\0", "", a.imagePath.c_str());
+        std::string p = saveDialog("Export whole image", a.imagePath.c_str(), {}, "All files");
         if (!p.empty()) { dump(p, a.disk.raw().data(), a.disk.raw().size());
             a.status = "Exported whole image -> " + p; }
     }
@@ -467,7 +479,7 @@ static void drawRawMap(App& a) {
                 if (ImGui::SmallButton("Export")) {
                     const char* ext = b.type==CarveType::Bload ? "bin" : b.type==CarveType::BasicTokenized ? "bas" : "bin";
                     char sug[64]; snprintf(sug, sizeof sug, "block_%06lX.%s", b.offset, ext);
-                    std::string p = saveDialog(a.hwnd, "All files\0*.*\0", ext, sug);
+                    std::string p = saveDialog("Export block", sug, {}, "All files");
                     if (!p.empty() && b.offset + b.length <= (long)a.rawCache.size())
                         dump(p, a.rawCache.data() + b.offset, b.length);
                 }
@@ -578,14 +590,14 @@ static void drawFileToolbar(App& a) {
     if (a.hexDirty || a.textDirty) { ImGui::SameLine(); ImGui::TextColored(kMod, "  * unsaved edits"); }
     ImGui::Separator();
     if (ImGui::Button("Export to file...")) {
-        std::string p = saveDialog(a.hwnd, "All files\0*.*\0", "", e.name.c_str());
+        std::string p = saveDialog("Export file", e.name.c_str(), {}, "All files");
         if (!p.empty()) { dump(p, a.selData.data(), a.selData.size());
             a.status = "Exported " + a.selName + " -> " + p; }
     }
     help("Write the selected file's bytes out to your PC as a normal file.");
     ImGui::SameLine();
     if (ImGui::Button("Import & replace...")) {
-        std::string p = openDialog(a.hwnd, "All files\0*.*\0");
+        std::string p = openDialog("Import & replace", {"*.*"}, "All files");
         if (!p.empty()) { auto v = slurp(p); saveFileToImage(a, v); }
     }
     help("Replace this file's contents with a file from your PC (grows/shrinks the cluster chain automatically).");
@@ -842,8 +854,17 @@ static void drawAbout(App& a) {
 int main(int argc, char** argv) {
     SDL_SetMainReady();
     if (SDL_Init(SDL_INIT_VIDEO) != 0) { fprintf(stderr, "SDL init: %s\n", SDL_GetError()); return 1; }
+#if defined(__APPLE__)
+    const char* glslVersion = "#version 150";           // macOS needs a core profile
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
+#else
+    const char* glslVersion = "#version 130";           // Windows / Linux
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+#endif
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_Window* win = SDL_CreateWindow("MSXFileForge",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 820,
@@ -857,11 +878,9 @@ int main(int argc, char** argv) {
     ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     applyTheme();
     ImGui_ImplSDL2_InitForOpenGL(win, gl);
-    ImGui_ImplOpenGL3_Init("#version 130");
+    ImGui_ImplOpenGL3_Init(glslVersion);
 
     App app;
-    SDL_SysWMinfo wm; SDL_VERSION(&wm.version);
-    if (SDL_GetWindowWMInfo(win, &wm)) app.hwnd = wm.info.win.window;
     if (argc > 1 && argv[1][0]) openPath(app, argv[1]);
 
     // Optional one-shot screenshot mode (for the README): MSXFF_SHOT=<png path>.
@@ -895,9 +914,8 @@ int main(int argc, char** argv) {
         // Shortcuts
         bool ctrl = io.KeyCtrl;
         if (ctrl && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
-            std::string p = openDialog(app.hwnd,
-                "MSX media\0*.dsk;*.dmk;*.di;*.rom;*.mx1;*.mx2;*.cas\0Disk images\0*.dsk;*.dmk;*.di\0"
-                "ROMs\0*.rom;*.mx1;*.mx2\0Tapes\0*.cas\0All files\0*.*\0");
+            std::string p = openDialog("Open MSX media",
+                {"*.dsk","*.dmk","*.di","*.rom","*.mx1","*.mx2","*.cas"}, "MSX media");
             if (!p.empty()) openPath(app, p);
         }
         if (ctrl && ImGui::IsKeyPressed(ImGuiKey_S, false) && app.mode == Mode::Disk) {
@@ -919,8 +937,8 @@ int main(int argc, char** argv) {
         if (ImGui::BeginMenuBar()) {
             if (ImGui::BeginMenu("File")) {
                 if (ImGui::MenuItem("Open...", "Ctrl+O")) {
-                    std::string p = openDialog(app.hwnd,
-                        "MSX media\0*.dsk;*.dmk;*.di;*.rom;*.mx1;*.mx2;*.cas\0All files\0*.*\0");
+                    std::string p = openDialog("Open MSX media",
+                        {"*.dsk","*.dmk","*.di","*.rom","*.mx1","*.mx2","*.cas"}, "MSX media");
                     if (!p.empty()) openPath(app, p);
                 }
                 bool disk = app.mode == Mode::Disk;

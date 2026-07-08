@@ -28,7 +28,7 @@
 
 static void setStdoutBinary() {
 #if defined(_WIN32)
-    setmode(fileno(stdout), O_BINARY); // stop \n -> \r\n mangling on raw output
+    _setmode(_fileno(stdout), _O_BINARY); // stop \n -> \r\n mangling on raw output
 #endif
 }
 

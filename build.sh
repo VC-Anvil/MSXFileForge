@@ -15,12 +15,13 @@ echo "[2/3] dsk2dmk tool"
 g++ -std=c++17 -O2 -o build/dsk2dmk.exe tools/dsk2dmk.cpp
 
 echo "[3/3] GUI"
+gcc -O2 -c libs/tinyfiledialogs.c -o build/tinyfiledialogs.o
 g++ -std=c++17 -O2 -DSDL_MAIN_HANDLED \
-  -I libs/imgui -I libs/SDL2/include \
-  gui/main.cpp $CORE \
+  -I libs/imgui -I libs/SDL2/include -I libs \
+  gui/main.cpp $CORE build/tinyfiledialogs.o \
   libs/imgui/imgui.cpp libs/imgui/imgui_draw.cpp libs/imgui/imgui_tables.cpp libs/imgui/imgui_widgets.cpp \
   libs/imgui/backends/imgui_impl_sdl2.cpp libs/imgui/backends/imgui_impl_opengl3.cpp \
-  libs/SDL2/lib/SDL2.dll -lopengl32 -lcomdlg32 -lshell32 \
+  libs/SDL2/lib/SDL2.dll -lopengl32 -lcomdlg32 -lole32 -lshell32 -luser32 \
   -o build/msxforge-gui.exe
 cp -f libs/SDL2/lib/SDL2.dll build/
 
