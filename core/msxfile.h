@@ -29,4 +29,9 @@ BloadHeader parseBloadHeader(const std::vector<uint8_t>& d);
 // Returns a plain-text listing. Best-effort on BCD floats.
 std::string detokenizeBasic(const std::vector<uint8_t>& d);
 
+// Tokenize a plain-text BASIC listing back into a tokenized program (output
+// begins with 0xFF, MSX text area base 0x8001). Inverse of detokenizeBasic;
+// designed so detokenizeBasic(tokenizeBasic(t)) reproduces t.
+std::vector<uint8_t> tokenizeBasic(const std::string& text);
+
 } // namespace msx

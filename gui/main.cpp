@@ -1,12 +1,19 @@
 // MSXFileForge - native GUI (Dear ImGui + SDL2 + OpenGL3).
 //
-// Open an MSX disk image (.dsk / raw / .dmk), a cartridge ROM, or a .cas tape by
-// dragging it onto the window or typing a path. Browse the FAT12 filesystem,
-// inspect any file as hex, detokenize BASIC, read BLOAD headers, identify ROM
-// mappers, and inspect the physical sector layout of protected / RAW images.
+// A real editor for MSX media: open a disk image (.dsk / raw / .dmk), cartridge
+// ROM, or .cas tape; browse the FAT12 filesystem; EDIT files as hex or as text
+// (BASIC is detokenized for editing and re-tokenized on save); save changes back
+// into the image and write the image out. Native Open/Save dialogs, an in-app
+// manual, and a protected/RAW sector inspector.
 #define SDL_MAIN_HANDLED
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <SDL.h>
 #include <SDL_opengl.h>
+#include <SDL_syswm.h>
+#include <windows.h>
+#include <commdlg.h>
+
 #include "imgui.h"
 #include "backends/imgui_impl_sdl2.h"
 #include "backends/imgui_impl_opengl3.h"
@@ -28,33 +35,44 @@ enum class Mode { None, Disk, Rom, Cas };
 
 struct App {
     Mode mode = Mode::None;
-    std::string loadedPath;
-    std::string status = "Drop an MSX .dsk / .dmk / .rom / .cas here, or type a path above.";
+    std::string imagePath;
+    std::string status = "Open an MSX .dsk / .dmk / .rom / .cas  (File > Open, drag & drop, or the path bar).";
 
-    // Disk
     DiskImage disk;
     Fat12 fs;
     bool fsMounted = false;
-    std::vector<DirEntry> listing;    // current directory listing
+    std::vector<DirEntry> listing;
     std::string cwd = "/";
     bool showDeleted = false;
 
-    // Selected file
+    // Selected file + edit buffers
     int selected = -1;
     std::string selName;
-    std::vector<uint8_t> selData;
+    std::vector<uint8_t> selData;     // editable hex buffer
+    std::vector<uint8_t> selOrig;     // pristine copy for change highlight
     MsxFileType selType = MsxFileType::Unknown;
-    std::string detok;
+    std::string editText;             // editable text / detokenized BASIC
     BloadHeader bload;
+    bool hexDirty = false;
+    bool textDirty = false;
+    int editByte = -1;                // hex cell currently being typed into
 
     // Rom / Cas
     std::vector<uint8_t> blob;
     RomInfo rom;
     std::vector<CasBlock> cas;
 
+    // Poke control
+    char pokeOff[16] = "0";
+    char pokeVal[8] = "00";
+
     char pathInput[1024] = {0};
+    bool showManual = false;
+    bool showAbout = false;
+    HWND hwnd = nullptr;
 };
 
+// ---- IO helpers -----------------------------------------------------------
 static std::vector<uint8_t> slurp(const std::string& p) {
     std::vector<uint8_t> v;
     FILE* f = fopen(p.c_str(), "rb");
@@ -64,125 +82,284 @@ static std::vector<uint8_t> slurp(const std::string& p) {
     fclose(f);
     return v;
 }
-
+static bool dump(const std::string& p, const uint8_t* d, size_t n) {
+    FILE* f = fopen(p.c_str(), "wb"); if (!f) return false;
+    size_t w = fwrite(d, 1, n, f); fclose(f); return w == n;
+}
 static bool hasExt(const std::string& p, const char* e) {
-    size_t n = strlen(e);
-    if (p.size() < n) return false;
+    size_t n = strlen(e); if (p.size() < n) return false;
     std::string t = p.substr(p.size()-n);
     for (auto& c : t) c = (char)tolower((unsigned char)c);
     return t == e;
 }
 
-static void selectFile(App& a, int idx) {
-    a.selected = idx;
-    a.detok.clear();
-    a.bload = BloadHeader{};
-    if (idx < 0 || idx >= (int)a.listing.size()) return;
-    const DirEntry& e = a.listing[idx];
-    a.selName = e.name;
-    if (e.isDir()) { a.selData.clear(); a.selType = MsxFileType::Unknown; return; }
-    a.selData = a.fs.readFile(e);
-    a.selType = detectType(a.selData);
-    if (a.selType == MsxFileType::BasicTokenized) a.detok = detokenizeBasic(a.selData);
-    if (a.selType == MsxFileType::BloadBinary)    a.bload = parseBloadHeader(a.selData);
+static std::string openDialog(HWND owner, const char* filter) {
+    char file[1024] = "";
+    OPENFILENAMEA o; memset(&o, 0, sizeof o);
+    o.lStructSize = sizeof o; o.hwndOwner = owner;
+    o.lpstrFilter = filter; o.lpstrFile = file; o.nMaxFile = sizeof file;
+    o.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+    return GetOpenFileNameA(&o) ? std::string(file) : std::string();
+}
+static std::string saveDialog(HWND owner, const char* filter, const char* defExt,
+                              const char* suggested = nullptr) {
+    char file[1024] = "";
+    if (suggested) strncpy(file, suggested, sizeof file - 1);
+    OPENFILENAMEA o; memset(&o, 0, sizeof o);
+    o.lStructSize = sizeof o; o.hwndOwner = owner;
+    o.lpstrFilter = filter; o.lpstrFile = file; o.nMaxFile = sizeof file;
+    o.lpstrDefExt = defExt;
+    o.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
+    return GetSaveFileNameA(&o) ? std::string(file) : std::string();
+}
+
+// ---- Model ops ------------------------------------------------------------
+static void clearSelection(App& a) {
+    a.selected = -1; a.selData.clear(); a.selOrig.clear(); a.editText.clear();
+    a.selType = MsxFileType::Unknown; a.hexDirty = a.textDirty = false; a.editByte = -1;
 }
 
 static void refreshListing(App& a) {
     a.listing = a.fs.list(a.cwd, a.showDeleted);
-    a.selected = -1; a.selData.clear(); a.detok.clear();
-    a.selType = MsxFileType::Unknown;
+    clearSelection(a);
+}
+
+static void selectFile(App& a, int idx) {
+    a.editByte = -1;
+    if (idx < 0 || idx >= (int)a.listing.size()) return;
+    const DirEntry& e = a.listing[idx];
+    a.selected = idx; a.selName = e.name;
+    a.hexDirty = a.textDirty = false;
+    a.bload = BloadHeader{};
+    if (e.isDir()) { a.selData.clear(); a.selOrig.clear(); a.editText.clear(); a.selType = MsxFileType::Unknown; return; }
+    a.selData = a.fs.readFile(e);
+    a.selOrig = a.selData;
+    a.selType = detectType(a.selData);
+    if (a.selType == MsxFileType::BasicTokenized)
+        a.editText = detokenizeBasic(a.selData);
+    else if (a.selType == MsxFileType::BasicAscii || a.selType == MsxFileType::Text)
+        a.editText.assign((const char*)a.selData.data(), a.selData.size());
+    else a.editText.clear();
+    a.editText.reserve(a.editText.size() + 4096);
+    if (a.selType == MsxFileType::BloadBinary) a.bload = parseBloadHeader(a.selData);
 }
 
 static void openPath(App& a, const std::string& path) {
-    a.loadedPath = path;
-    a.mode = Mode::None;
-    a.fsMounted = false;
-    a.selected = -1; a.selData.clear(); a.detok.clear();
-    a.listing.clear(); a.cas.clear(); a.blob.clear();
-    a.cwd = "/";
+    a.imagePath = path; a.mode = Mode::None; a.fsMounted = false;
+    a.listing.clear(); a.cas.clear(); a.blob.clear(); a.cwd = "/";
+    clearSelection(a);
+    strncpy(a.pathInput, path.c_str(), sizeof(a.pathInput)-1);
 
     if (hasExt(path, ".rom") || hasExt(path, ".mx1") || hasExt(path, ".mx2")) {
         a.blob = slurp(path);
         if (a.blob.empty()) { a.status = "Cannot read ROM: " + path; return; }
-        a.rom = analyzeRom(a.blob);
-        a.mode = Mode::Rom;
-        a.status = "Loaded ROM (" + std::to_string(a.blob.size()) + " bytes)";
-        return;
+        a.rom = analyzeRom(a.blob); a.mode = Mode::Rom;
+        a.status = "ROM loaded (" + std::to_string(a.blob.size()) + " bytes)"; return;
     }
     if (hasExt(path, ".cas")) {
         a.blob = slurp(path);
         if (a.blob.empty()) { a.status = "Cannot read CAS: " + path; return; }
-        a.cas = parseCas(a.blob);
-        a.mode = Mode::Cas;
-        a.status = "Loaded CAS (" + std::to_string(a.cas.size()) + " blocks)";
-        return;
+        a.cas = parseCas(a.blob); a.mode = Mode::Cas;
+        a.status = "CAS loaded (" + std::to_string(a.cas.size()) + " blocks)"; return;
     }
-    // Default: treat as a disk image.
     std::string err;
     if (!a.disk.load(path, &err)) { a.status = "Load error: " + err; return; }
     a.mode = Mode::Disk;
     a.fsMounted = a.fs.mount(a.disk, &err);
-    if (a.fsMounted) refreshListing(a);
-    else a.listing.clear();
+    if (a.fsMounted) refreshListing(a); else a.listing.clear();
     a.status = std::string("Loaded ") + to_string(a.disk.format()) +
                (a.disk.isProtected() ? "  [PROTECTED]" : "") +
-               (a.fsMounted ? "  FAT12 ok" : ("  no FS: " + err));
+               (a.fsMounted ? "  |  FAT12 OK" : ("  |  no FS: " + err));
 }
 
-// ---- Hex view -------------------------------------------------------------
-static void drawHex(const std::vector<uint8_t>& d, const char* id) {
+// Write the current file's edited bytes back into the image (in memory).
+static void saveFileToImage(App& a, const std::vector<uint8_t>& bytes) {
+    if (a.selected < 0) { a.status = "No file selected."; return; }
+    std::string name = a.listing[a.selected].name;
+    std::string err;
+    // Re-fetch a fresh mutable entry (writeFile updates it in place).
+    if (!a.fs.writeFile(a.listing[a.selected], bytes, &err)) {
+        a.status = "Write failed: " + err; return;
+    }
+    a.status = "Saved '" + name + "' into image (" + std::to_string(bytes.size()) +
+               " bytes). Image modified - use File > Save image.";
+    // Refresh and reselect by name.
+    refreshListing(a);
+    for (int i = 0; i < (int)a.listing.size(); ++i)
+        if (a.listing[i].name == name) { selectFile(a, i); break; }
+}
+
+static void saveImageAs(App& a) {
+    std::string p = saveDialog(a.hwnd,
+        "MSX disk image\0*.dsk\0DMK track image\0*.dmk\0All files\0*.*\0",
+        "dsk", a.imagePath.c_str());
+    if (p.empty()) return;
+    std::string err;
+    if (a.disk.save(p, &err)) { a.disk.clearDirty(); a.imagePath = p; a.status = "Image saved: " + p; }
+    else a.status = "Save failed: " + err;
+}
+static void saveImage(App& a) {
+    if (a.imagePath.empty()) { saveImageAs(a); return; }
+    std::string err;
+    if (a.disk.save(a.imagePath, &err)) { a.disk.clearDirty(); a.status = "Image saved: " + a.imagePath; }
+    else a.status = "Save failed: " + err;
+}
+
+// ---- Theme ----------------------------------------------------------------
+static void applyTheme() {
+    ImGui::StyleColorsDark();
+    ImGuiStyle& s = ImGui::GetStyle();
+    s.WindowPadding = ImVec2(12, 12);
+    s.FramePadding  = ImVec2(9, 5);
+    s.ItemSpacing   = ImVec2(9, 7);
+    s.ItemInnerSpacing = ImVec2(7, 5);
+    s.CellPadding   = ImVec2(8, 4);
+    s.WindowRounding = 6; s.FrameRounding = 5; s.GrabRounding = 5;
+    s.ChildRounding = 5; s.PopupRounding = 5; s.TabRounding = 5;
+    s.ScrollbarRounding = 8; s.WindowBorderSize = 1; s.FrameBorderSize = 0;
+    ImVec4* c = s.Colors;
+    ImVec4 accent(0.36f, 0.72f, 0.92f, 1.0f);   // cyan-blue accent
+    ImVec4 accentDim(0.20f, 0.42f, 0.56f, 1.0f);
+    c[ImGuiCol_WindowBg]        = ImVec4(0.10f,0.11f,0.13f,1.0f);
+    c[ImGuiCol_ChildBg]         = ImVec4(0.12f,0.13f,0.16f,1.0f);
+    c[ImGuiCol_PopupBg]         = ImVec4(0.10f,0.11f,0.13f,0.98f);
+    c[ImGuiCol_Border]          = ImVec4(0.24f,0.27f,0.32f,0.6f);
+    c[ImGuiCol_FrameBg]         = ImVec4(0.16f,0.18f,0.22f,1.0f);
+    c[ImGuiCol_FrameBgHovered]  = accentDim;
+    c[ImGuiCol_FrameBgActive]   = accent;
+    c[ImGuiCol_TitleBgActive]   = accentDim;
+    c[ImGuiCol_MenuBarBg]       = ImVec4(0.13f,0.15f,0.19f,1.0f);
+    c[ImGuiCol_Header]          = accentDim;
+    c[ImGuiCol_HeaderHovered]   = ImVec4(0.28f,0.55f,0.72f,1.0f);
+    c[ImGuiCol_HeaderActive]    = accent;
+    c[ImGuiCol_Button]          = ImVec4(0.20f,0.32f,0.42f,1.0f);
+    c[ImGuiCol_ButtonHovered]   = accentDim;
+    c[ImGuiCol_ButtonActive]    = accent;
+    c[ImGuiCol_Tab]             = ImVec4(0.15f,0.18f,0.22f,1.0f);
+    c[ImGuiCol_TabHovered]      = accentDim;
+    c[ImGuiCol_TabActive]       = accentDim;
+    c[ImGuiCol_CheckMark]       = accent;
+    c[ImGuiCol_SliderGrab]      = accent;
+    c[ImGuiCol_TableHeaderBg]   = ImVec4(0.18f,0.22f,0.28f,1.0f);
+    c[ImGuiCol_TableRowBg]      = ImVec4(0.12f,0.13f,0.16f,1.0f);
+    c[ImGuiCol_TableRowBgAlt]   = ImVec4(0.145f,0.16f,0.19f,1.0f);
+    c[ImGuiCol_TableBorderLight]= ImVec4(0.24f,0.27f,0.32f,0.5f);
+    c[ImGuiCol_Text]            = ImVec4(0.90f,0.92f,0.95f,1.0f);
+    c[ImGuiCol_TextDisabled]    = ImVec4(0.52f,0.56f,0.62f,1.0f);
+}
+
+static const ImVec4 kAccent(0.42f,0.80f,1.0f,1.0f);
+static const ImVec4 kDir(0.98f,0.80f,0.35f,1.0f);
+static const ImVec4 kWarn(1.0f,0.62f,0.25f,1.0f);
+static const ImVec4 kDel(1.0f,0.42f,0.42f,1.0f);
+static const ImVec4 kMod(1.0f,0.85f,0.30f,1.0f);
+static const ImVec4 kGreen(0.5f,0.85f,0.45f,1.0f);
+
+static void help(const char* txt) {
+    ImGui::SameLine(); ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(360);
+        ImGui::TextUnformatted(txt);
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
+}
+
+// ---- Hex editor -----------------------------------------------------------
+static void drawHexEditor(App& a, std::vector<uint8_t>& d, const std::vector<uint8_t>& orig,
+                          bool editable, const char* id, bool* dirty) {
+    // Poke row (robust explicit editing).
+    if (editable) {
+        ImGui::SetNextItemWidth(120);
+        ImGui::InputText("offset(hex)", a.pokeOff, sizeof a.pokeOff, ImGuiInputTextFlags_CharsHexadecimal);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(70);
+        ImGui::InputText("val", a.pokeVal, sizeof a.pokeVal, ImGuiInputTextFlags_CharsHexadecimal);
+        ImGui::SameLine();
+        if (ImGui::Button("Set byte")) {
+            long off = strtol(a.pokeOff, nullptr, 16);
+            int val = (int)strtol(a.pokeVal, nullptr, 16) & 0xFF;
+            if (off >= 0 && off < (long)d.size()) { d[off] = (uint8_t)val; *dirty = true; }
+        }
+        help("Type an offset and a byte value in hex, then Set byte. Or click any byte in the grid to edit it inline. Modified bytes turn yellow.");
+        ImGui::SameLine(); ImGui::TextDisabled("| click a byte to edit inline");
+    }
     ImGui::BeginChild(id, ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 2));
+    float charW = ImGui::CalcTextSize("F").x;
     ImGuiListClipper clip;
     int rows = (int)((d.size() + 15) / 16);
     clip.Begin(rows);
     while (clip.Step()) {
         for (int r = clip.DisplayStart; r < clip.DisplayEnd; ++r) {
             size_t base = (size_t)r * 16;
-            char line[128];
-            int off = snprintf(line, sizeof line, "%06zX  ", base);
-            ImGui::TextUnformatted(line, line + off);
-            ImGui::SameLine(0, 0);
-            std::string hex, asc;
-            for (int c = 0; c < 16; ++c) {
-                if (base + c < d.size()) {
-                    char h[4]; snprintf(h, sizeof h, "%02X ", d[base + c]);
-                    hex += h;
-                    uint8_t ch = d[base + c];
-                    asc += (ch >= 0x20 && ch < 0x7F) ? (char)ch : '.';
-                } else { hex += "   "; asc += ' '; }
-                if (c == 7) hex += ' ';
+            ImGui::TextDisabled("%06zX", base);
+            ImGui::SameLine(0, charW);
+            for (int col = 0; col < 16; ++col) {
+                size_t idx = base + col;
+                ImGui::SameLine(0, col == 8 ? charW * 1.4f : charW * 0.6f);
+                if (idx >= d.size()) { ImGui::TextDisabled("  "); continue; }
+                ImGui::PushID((int)idx);
+                if (editable && a.editByte == (int)idx) {
+                    char buf[4]; snprintf(buf, sizeof buf, "%02X", d[idx]);
+                    ImGui::SetNextItemWidth(charW * 2.6f);
+                    ImGui::SetKeyboardFocusHere();
+                    if (ImGui::InputText("##e", buf, sizeof buf,
+                            ImGuiInputTextFlags_CharsHexadecimal | ImGuiInputTextFlags_CharsUppercase |
+                            ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll)) {
+                        d[idx] = (uint8_t)(strtol(buf, nullptr, 16) & 0xFF);
+                        *dirty = true; a.editByte = -1;
+                    }
+                    if (ImGui::IsItemDeactivated()) {
+                        d[idx] = (uint8_t)(strtol(buf, nullptr, 16) & 0xFF);
+                        *dirty = true; a.editByte = -1;
+                    }
+                } else {
+                    bool changed = idx < orig.size() && d[idx] != orig[idx];
+                    if (changed) ImGui::PushStyleColor(ImGuiCol_Text, kMod);
+                    char cell[4]; snprintf(cell, sizeof cell, "%02X", d[idx]);
+                    ImGui::TextUnformatted(cell);
+                    if (changed) ImGui::PopStyleColor();
+                    if (editable && ImGui::IsItemClicked()) a.editByte = (int)idx;
+                }
+                ImGui::PopID();
             }
-            ImGui::TextUnformatted(hex.c_str());
-            ImGui::SameLine();
+            // ASCII column
+            ImGui::SameLine(0, charW * 1.6f);
+            std::string asc;
+            for (int col = 0; col < 16 && base + col < d.size(); ++col) {
+                uint8_t ch = d[base + col];
+                asc += (ch >= 0x20 && ch < 0x7F) ? (char)ch : '.';
+            }
             ImGui::TextDisabled("%s", asc.c_str());
         }
     }
+    ImGui::PopStyleVar();
     ImGui::EndChild();
 }
 
-// ---- Panels ---------------------------------------------------------------
-static void drawDiskInfoBar(App& a) {
-    ImGui::TextDisabled("Format:"); ImGui::SameLine();
-    ImGui::TextUnformatted(to_string(a.disk.format()));
-    ImGui::SameLine(); ImGui::TextDisabled(" | Geometry:"); ImGui::SameLine();
-    ImGui::Text("%dc x %dh x %ds", a.disk.cylinders(), a.disk.heads(), a.disk.sectorsPerTrack());
-    if (a.disk.isProtected()) {
-        ImGui::SameLine(); ImGui::TextColored(ImVec4(1,0.5f,0.2f,1), " [PROTECTED]");
+// ---- Text resize callback for std::string editor --------------------------
+static int textResize(ImGuiInputTextCallbackData* data) {
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackResize) {
+        std::string* s = (std::string*)data->UserData;
+        s->resize(data->BufTextLen);
+        data->Buf = (char*)s->c_str();
     }
-    if (a.fsMounted) {
-        ImGui::SameLine(); ImGui::TextDisabled(" | FAT12:"); ImGui::SameLine();
-        ImGui::Text("OEM '%s'  free %ld KB", a.fs.oemName().c_str(), a.fs.freeBytes()/1024);
-    }
+    return 0;
 }
 
+// ---- Panels ---------------------------------------------------------------
 static void drawFileTree(App& a) {
-    ImGui::Checkbox("Show deleted", &a.showDeleted);
+    if (ImGui::Checkbox("Show deleted", &a.showDeleted)) refreshListing(a);
+    help("Also list directory entries whose first byte is 0xE5 (deleted files). "
+         "Their data may still be recoverable if the clusters were not reused.");
     ImGui::SameLine();
     if (ImGui::Button("Refresh")) refreshListing(a);
     ImGui::Separator();
-    if (!a.fsMounted) { ImGui::TextDisabled("No FAT12 filesystem."); return; }
+    if (!a.fsMounted) { ImGui::TextDisabled("No FAT12 filesystem on this image."); return; }
 
-    ImGui::Text("%s", a.cwd.c_str());
+    ImGui::TextColored(kAccent, "%s", a.cwd.c_str());
     if (a.cwd != "/") {
         if (ImGui::Selectable(".. (up)")) {
             size_t slash = a.cwd.find_last_of('/');
@@ -190,66 +367,139 @@ static void drawFileTree(App& a) {
             refreshListing(a);
         }
     }
-    for (int i = 0; i < (int)a.listing.size(); ++i) {
-        const DirEntry& e = a.listing[i];
-        if (e.isVolume()) continue;
-        char label[96];
-        snprintf(label, sizeof label, "%s %-13s %8u  [%s]",
-                 e.isDir() ? "[DIR]" : "     ", e.name.c_str(), e.size, e.attrString().c_str());
-        bool sel = (i == a.selected);
-        if (ImGui::Selectable(label, sel)) {
-            if (e.isDir() && e.name != "." && e.name != "..") {
-                a.cwd = (a.cwd == "/" ? "/" : a.cwd + "/") + e.name;
-                if (a.cwd.substr(0,2) == "//") a.cwd = a.cwd.substr(1);
-                refreshListing(a);
-            } else {
-                selectFile(a, i);
+    if (ImGui::BeginTable("files", 3,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 70);
+        ImGui::TableSetupColumn("Attr", ImGuiTableColumnFlags_WidthFixed, 62);
+        ImGui::TableHeadersRow();
+        for (int i = 0; i < (int)a.listing.size(); ++i) {
+            const DirEntry& e = a.listing[i];
+            if (e.isVolume()) continue;
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImVec4 col = e.deleted ? kDel : (e.isDir() ? kDir : ImGui::GetStyle().Colors[ImGuiCol_Text]);
+            ImGui::PushStyleColor(ImGuiCol_Text, col);
+            char label[80];
+            snprintf(label, sizeof label, "%s%s", e.isDir() ? "[D] " : "    ", e.name.c_str());
+            bool sel = (i == a.selected);
+            if (ImGui::Selectable(label, sel, ImGuiSelectableFlags_SpanAllColumns)) {
+                if (e.isDir() && e.name != "." && e.name != "..") {
+                    a.cwd = (a.cwd == "/" ? "/" : a.cwd + "/") + e.name;
+                    refreshListing(a);
+                } else selectFile(a, i);
             }
+            ImGui::PopStyleColor();
+            ImGui::TableNextColumn();
+            if (!e.isDir()) ImGui::Text("%u", e.size); else ImGui::TextDisabled("<dir>");
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", e.attrString().c_str());
         }
-        if (e.deleted) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1,0.4f,0.4f,1), "del"); }
+        ImGui::EndTable();
     }
 }
 
+static void drawFileToolbar(App& a) {
+    const DirEntry& e = a.listing[a.selected];
+    ImGui::TextColored(kAccent, "%s", a.selName.c_str());
+    ImGui::SameLine(); ImGui::TextDisabled("(%zu bytes, %s)", a.selData.size(), typeName(a.selType));
+    if (a.hexDirty || a.textDirty) { ImGui::SameLine(); ImGui::TextColored(kMod, "  * unsaved edits"); }
+    ImGui::Separator();
+    if (ImGui::Button("Export to file...")) {
+        std::string p = saveDialog(a.hwnd, "All files\0*.*\0", "", e.name.c_str());
+        if (!p.empty()) { dump(p, a.selData.data(), a.selData.size());
+            a.status = "Exported " + a.selName + " -> " + p; }
+    }
+    help("Write the selected file's bytes out to your PC as a normal file.");
+    ImGui::SameLine();
+    if (ImGui::Button("Import & replace...")) {
+        std::string p = openDialog(a.hwnd, "All files\0*.*\0");
+        if (!p.empty()) { auto v = slurp(p); saveFileToImage(a, v); }
+    }
+    help("Replace this file's contents with a file from your PC (grows/shrinks the cluster chain automatically).");
+    ImGui::SameLine();
+    if (ImGui::Button("Delete file")) {
+        std::string err, name = a.selName;
+        if (a.fs.deleteFile(e, &err)) { a.status = "Deleted " + name + " (image modified)"; refreshListing(a); }
+        else a.status = "Delete failed: " + err;
+    }
+    help("Mark the file deleted and free its clusters. Save the image to persist.");
+}
+
 static void drawPreview(App& a) {
+    if (a.selected < 0) { ImGui::TextDisabled("Select a file on the left to view or edit it."); }
+    else if (!a.listing[a.selected].isDir()) drawFileToolbar(a);
+
     if (ImGui::BeginTabBar("preview")) {
-        // File-oriented tabs
-        if (a.selected >= 0 && !a.selData.empty()) {
-            ImGui::Text("%s  (%zu bytes)  -  %s", a.selName.c_str(),
-                        a.selData.size(), typeName(a.selType));
-            if (a.selType == MsxFileType::BasicTokenized && ImGui::BeginTabItem("BASIC")) {
-                ImGui::BeginChild("basic", ImVec2(0,0), true);
-                ImGui::TextUnformatted(a.detok.c_str());
-                ImGui::EndChild();
+        bool haveFile = a.selected >= 0 && !a.listing[a.selected].isDir();
+        if (haveFile && (a.selType == MsxFileType::BasicTokenized ||
+                         a.selType == MsxFileType::BasicAscii ||
+                         a.selType == MsxFileType::Text)) {
+            const char* tabName = (a.selType == MsxFileType::BasicTokenized) ? "BASIC (edit)" : "Text (edit)";
+            if (ImGui::BeginTabItem(tabName)) {
+                ImGui::TextDisabled(a.selType == MsxFileType::BasicTokenized ?
+                    "Edit the listing; Save re-tokenizes it back into the file." :
+                    "Edit the text; Save writes it back as-is.");
+                if (ImGui::Button("Save to image")) {
+                    std::vector<uint8_t> bytes;
+                    if (a.selType == MsxFileType::BasicTokenized)
+                        bytes = tokenizeBasic(a.editText);
+                    else bytes.assign(a.editText.begin(), a.editText.end());
+                    saveFileToImage(a, bytes);
+                    a.textDirty = false;
+                }
+                help("BASIC is re-tokenized (text -> tokens) then written into the image. Save the image afterwards to persist to disk.");
+                ImGui::SameLine();
+                if (ImGui::Button("Revert")) selectFile(a, a.selected);
+                if (a.textDirty) { ImGui::SameLine(); ImGui::TextColored(kMod, "* edited"); }
+                ImVec2 sz = ImGui::GetContentRegionAvail();
+                if (a.editText.capacity() < a.editText.size() + 256)
+                    a.editText.reserve(a.editText.size() + 4096);
+                if (ImGui::InputTextMultiline("##text", (char*)a.editText.c_str(),
+                        a.editText.capacity() + 1, sz,
+                        ImGuiInputTextFlags_CallbackResize | ImGuiInputTextFlags_AllowTabInput,
+                        textResize, &a.editText))
+                    a.textDirty = true;
                 ImGui::EndTabItem();
             }
-            if (a.selType == MsxFileType::BloadBinary && ImGui::BeginTabItem("BLOAD")) {
-                ImGui::Text("start = 0x%04X", a.bload.start);
-                ImGui::Text("end   = 0x%04X", a.bload.end);
-                ImGui::Text("exec  = 0x%04X", a.bload.exec);
-                ImGui::Text("size  = %u bytes", a.bload.end - a.bload.start + 1);
-                ImGui::EndTabItem();
-            }
-            if (ImGui::BeginTabItem("Hex")) { drawHex(a.selData, "filehex"); ImGui::EndTabItem(); }
-        } else {
-            ImGui::TextDisabled("Select a file to preview.");
         }
-        // Whole-image hex
-        if (ImGui::BeginTabItem("Raw image")) {
-            ImGui::Text("Container bytes: %zu", a.disk.raw().size());
-            drawHex(a.disk.raw(), "rawhex");
+        if (haveFile && a.selType == MsxFileType::BloadBinary && ImGui::BeginTabItem("BLOAD")) {
+            ImGui::Text("start address : 0x%04X", a.bload.start);
+            ImGui::Text("end address   : 0x%04X", a.bload.end);
+            ImGui::Text("exec address  : 0x%04X", a.bload.exec);
+            ImGui::Text("payload size  : %u bytes", a.bload.end - a.bload.start + 1);
+            ImGui::TextDisabled("Edit the raw bytes in the Hex tab.");
             ImGui::EndTabItem();
         }
-        // Protection inspector
+        if (haveFile && ImGui::BeginTabItem("Hex (edit)")) {
+            if (ImGui::Button("Save to image")) { saveFileToImage(a, a.selData); a.hexDirty = false; }
+            help("Write the edited bytes back into the file (same length). Then File > Save image to persist.");
+            ImGui::SameLine();
+            if (ImGui::Button("Revert")) selectFile(a, a.selected);
+            if (a.hexDirty) { ImGui::SameLine(); ImGui::TextColored(kMod, "* edited"); }
+            drawHexEditor(a, a.selData, a.selOrig, true, "filehex", &a.hexDirty);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Raw image")) {
+            ImGui::TextDisabled("Whole container (%zu bytes). Editable; touches the image directly.",
+                                a.disk.raw().size());
+            static bool dummy = false;
+            drawHexEditor(a, a.disk.rawMut(), a.disk.raw(), true, "rawhex", &dummy);
+            ImGui::EndTabItem();
+        }
         if (ImGui::BeginTabItem("Protection / sectors")) {
-            ImGui::Text("Physical sectors: %zu   Protected: %s",
-                        a.disk.sectors().size(), a.disk.isProtected() ? "YES" : "no");
+            ImGui::Text("Physical sectors: %zu", a.disk.sectors().size());
+            ImGui::SameLine();
+            ImGui::TextColored(a.disk.isProtected() ? kWarn : kGreen,
+                               a.disk.isProtected() ? " PROTECTED" : " standard layout");
             if (a.disk.isProtected())
-                ImGui::TextColored(ImVec4(1,0.6f,0.2f,1), "%s", a.disk.protectionReport().c_str());
+                ImGui::TextColored(kWarn, "%s", a.disk.protectionReport().c_str());
             ImGui::Separator();
-            ImGui::BeginChild("sec", ImVec2(0,0), true);
-            if (ImGui::BeginTable("sectors", 6, ImGuiTableFlags_RowBg|ImGuiTableFlags_Borders|ImGuiTableFlags_ScrollY)) {
-                ImGui::TableSetupColumn("C"); ImGui::TableSetupColumn("H");
-                ImGui::TableSetupColumn("S"); ImGui::TableSetupColumn("Size");
+            if (ImGui::BeginTable("sectors", 6, ImGuiTableFlags_RowBg|ImGuiTableFlags_Borders|
+                                  ImGuiTableFlags_ScrollY)) {
+                ImGui::TableSetupColumn("Cyl"); ImGui::TableSetupColumn("Head");
+                ImGui::TableSetupColumn("Sec"); ImGui::TableSetupColumn("Size");
                 ImGui::TableSetupColumn("LBA"); ImGui::TableSetupColumn("Flags");
                 ImGui::TableHeadersRow();
                 for (auto& s : a.disk.sectors()) {
@@ -257,7 +507,8 @@ static void drawPreview(App& a) {
                     ImGui::TableNextColumn(); ImGui::Text("%d", s.cyl);
                     ImGui::TableNextColumn(); ImGui::Text("%d", s.head);
                     ImGui::TableNextColumn(); ImGui::Text("%d", s.sec);
-                    ImGui::TableNextColumn(); ImGui::Text("%zu", s.size);
+                    ImGui::TableNextColumn();
+                    if (s.size != 512) ImGui::TextColored(kWarn, "%zu", s.size); else ImGui::Text("%zu", s.size);
                     ImGui::TableNextColumn(); ImGui::Text("%ld", s.lba);
                     ImGui::TableNextColumn();
                     std::string f;
@@ -265,12 +516,10 @@ static void drawPreview(App& a) {
                     if (s.deleted) f += "DELETED ";
                     if (s.idCrcError) f += "IDCRC ";
                     if (s.dataCrcError) f += "DATACRC ";
-                    if (f.empty()) ImGui::TextDisabled("-");
-                    else ImGui::TextColored(ImVec4(1,0.6f,0.2f,1), "%s", f.c_str());
+                    if (f.empty()) ImGui::TextDisabled("-"); else ImGui::TextColored(kWarn, "%s", f.c_str());
                 }
                 ImGui::EndTable();
             }
-            ImGui::EndChild();
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
@@ -278,7 +527,7 @@ static void drawPreview(App& a) {
 }
 
 static void drawRom(App& a) {
-    ImGui::Text("ROM: %s", a.loadedPath.c_str());
+    ImGui::TextColored(kAccent, "ROM  %s", a.imagePath.c_str());
     ImGui::Separator();
     ImGui::Text("Size    : %ld bytes  (%d x 16KB pages)", a.rom.size, a.rom.pages16k);
     ImGui::Text("Header  : 'AB' @0x0000 %s   @0x4000 %s",
@@ -286,13 +535,14 @@ static void drawRom(App& a) {
     if (a.rom.hasHeaderAt0 || a.rom.hasHeaderAt4000)
         ImGui::Text("Entries : INIT=%04X STATEMENT=%04X DEVICE=%04X TEXT=%04X",
                     a.rom.init, a.rom.statement, a.rom.device, a.rom.text);
-    ImGui::Text("Mapper  : %s", mapperName(a.rom.mapper));
+    ImGui::TextColored(kGreen, "Mapper  : %s", mapperName(a.rom.mapper));
     ImGui::Separator();
-    drawHex(a.blob, "romhex");
+    static bool dummy = false;
+    drawHexEditor(a, a.blob, a.blob, false, "romhex", &dummy);
 }
 
 static void drawCas(App& a) {
-    ImGui::Text("CAS: %s  (%zu blocks)", a.loadedPath.c_str(), a.cas.size());
+    ImGui::TextColored(kAccent, "CAS  %s  (%zu blocks)", a.imagePath.c_str(), a.cas.size());
     ImGui::Separator();
     if (ImGui::BeginTable("cas", 4, ImGuiTableFlags_RowBg|ImGuiTableFlags_Borders)) {
         ImGui::TableSetupColumn("Offset"); ImGui::TableSetupColumn("Kind");
@@ -302,26 +552,84 @@ static void drawCas(App& a) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn(); ImGui::Text("0x%06lX", b.offset);
             ImGui::TableNextColumn(); ImGui::TextUnformatted(casKindName(b.kind));
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(b.filename.c_str());
+            ImGui::TableNextColumn(); ImGui::TextColored(kAccent, "%s", b.filename.c_str());
             ImGui::TableNextColumn(); ImGui::Text("%ld", b.dataLength);
         }
         ImGui::EndTable();
     }
 }
 
+static void drawManual(App& a) {
+    if (!a.showManual) return;
+    ImGui::SetNextWindowSize(ImVec2(620, 560), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Manual / Help", &a.showManual)) {
+        ImGui::TextColored(kAccent, "MSXFileForge - what everything does");
+        ImGui::Separator();
+        auto H = [](const char* t){ ImGui::Spacing(); ImGui::TextColored(kDir, "%s", t); };
+        auto P = [](const char* t){ ImGui::PushTextWrapPos(0); ImGui::TextUnformatted(t); ImGui::PopTextWrapPos(); };
+
+        H("Opening media");
+        P("File > Open (Ctrl+O), drag a file onto the window, or paste a path in the top bar and press Open. "
+          "Supported: disk images .dsk / raw / .dmk, cartridge .rom (.mx1/.mx2), and .cas tapes.");
+
+        H("Browsing a disk");
+        P("The left panel lists the FAT12 filesystem. Directories are yellow and marked [D]; deleted "
+          "entries are red (enable 'Show deleted'). Click a directory to enter it, '.. (up)' to go back, "
+          "and a file to open it on the right.");
+
+        H("Editing a file");
+        P("- BASIC (edit): tokenized BASIC is shown as a normal listing you can edit. 'Save to image' "
+          "re-tokenizes it and writes it back.\n"
+          "- Text (edit): ASCII files are edited as plain text.\n"
+          "- Hex (edit): click any byte to type a new value, or use the offset/value 'Set byte' box. "
+          "Changed bytes are highlighted yellow. 'Save to image' writes the bytes back.\n"
+          "Growing or shrinking a file automatically re-allocates FAT clusters.");
+
+        H("Import / Export / Delete");
+        P("Export writes the selected file to your PC. Import & replace swaps its contents with a PC file. "
+          "Delete frees the file's clusters and marks the entry deleted.");
+
+        H("Saving");
+        P("Edits live in an in-memory copy of the image until you choose File > Save image (Ctrl+S) or "
+          "Save image as (Ctrl+Shift+S). The status bar shows when the image has unsaved changes.");
+
+        H("Protected / RAW disks");
+        P("Open a .dmk and use the 'Protection / sectors' tab to see the real physical sector layout: "
+          "non-standard sizes, deleted-data marks and CRC anomalies are flagged in orange. The normal "
+          "FAT12 filesystem is still reconstructed from the standard sectors where possible.");
+
+        H("ROM / CAS");
+        P("ROMs show size, page count, the AB header entry points and a detected mapper "
+          "(Konami / SCC / ASCII8 / ASCII16). CAS files show their block layout and file names.");
+        ImGui::Spacing();
+        ImGui::TextDisabled("Tip: hover any (?) marker for context help.");
+    }
+    ImGui::End();
+}
+
+static void drawAbout(App& a) {
+    if (!a.showAbout) return;
+    ImGui::SetNextWindowSize(ImVec2(420, 220), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("About MSXFileForge", &a.showAbout)) {
+        ImGui::TextColored(kAccent, "MSXFileForge  v0.2");
+        ImGui::TextWrapped("A native editor/inspector for MSX disk images, files, ROMs and tapes, "
+                           "with protected/RAW (.dmk) support.");
+        ImGui::Separator();
+        ImGui::TextDisabled("Dear ImGui + SDL2 + OpenGL3. FAT12 read/write, BASIC (de)tokenizer, "
+                            "ROM mapper detection, cassette parser.");
+    }
+    ImGui::End();
+}
+
 int main(int argc, char** argv) {
     SDL_SetMainReady();
     if (SDL_Init(SDL_INIT_VIDEO) != 0) { fprintf(stderr, "SDL init: %s\n", SDL_GetError()); return 1; }
-    const char* glsl = "#version 130";
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
-
     SDL_Window* win = SDL_CreateWindow("MSXFileForge",
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1200, 760,
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 820,
         SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
-    if (!win) { fprintf(stderr, "window: %s\n", SDL_GetError()); return 1; }
     SDL_GLContext gl = SDL_GL_CreateContext(win);
     SDL_GL_MakeCurrent(win, gl);
     SDL_GL_SetSwapInterval(1);
@@ -329,15 +637,14 @@ int main(int argc, char** argv) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    ImGui::StyleColorsDark();
+    applyTheme();
     ImGui_ImplSDL2_InitForOpenGL(win, gl);
-    ImGui_ImplOpenGL3_Init(glsl);
+    ImGui_ImplOpenGL3_Init("#version 130");
 
     App app;
-    if (argc > 1 && argv[1][0]) {
-        strncpy(app.pathInput, argv[1], sizeof(app.pathInput) - 1);
-        openPath(app, argv[1]);
-    }
+    SDL_SysWMinfo wm; SDL_VERSION(&wm.version);
+    if (SDL_GetWindowWMInfo(win, &wm)) app.hwnd = wm.info.win.window;
+    if (argc > 1 && argv[1][0]) openPath(app, argv[1]);
 
     bool running = true;
     while (running) {
@@ -345,14 +652,21 @@ int main(int argc, char** argv) {
         while (SDL_PollEvent(&ev)) {
             ImGui_ImplSDL2_ProcessEvent(&ev);
             if (ev.type == SDL_QUIT) running = false;
-            if (ev.type == SDL_WINDOWEVENT && ev.window.event == SDL_WINDOWEVENT_CLOSE &&
-                ev.window.windowID == SDL_GetWindowID(win)) running = false;
-            if (ev.type == SDL_DROPFILE) {
-                std::string p = ev.drop.file;
-                SDL_free(ev.drop.file);
-                openPath(app, p);
-            }
+            if (ev.type == SDL_DROPFILE) { std::string p = ev.drop.file; SDL_free(ev.drop.file); openPath(app, p); }
         }
+        ImGuiIO& io = ImGui::GetIO();
+        // Shortcuts
+        bool ctrl = io.KeyCtrl;
+        if (ctrl && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
+            std::string p = openDialog(app.hwnd,
+                "MSX media\0*.dsk;*.dmk;*.di;*.rom;*.mx1;*.mx2;*.cas\0Disk images\0*.dsk;*.dmk;*.di\0"
+                "ROMs\0*.rom;*.mx1;*.mx2\0Tapes\0*.cas\0All files\0*.*\0");
+            if (!p.empty()) openPath(app, p);
+        }
+        if (ctrl && ImGui::IsKeyPressed(ImGuiKey_S, false) && app.mode == Mode::Disk) {
+            if (io.KeyShift) saveImageAs(app); else saveImage(app);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_F1, false)) app.showManual = true;
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL2_NewFrame();
@@ -363,45 +677,97 @@ int main(int argc, char** argv) {
         ImGui::SetNextWindowSize(vp->WorkSize);
         ImGui::Begin("##main", nullptr,
             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus);
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_MenuBar);
+
+        if (ImGui::BeginMenuBar()) {
+            if (ImGui::BeginMenu("File")) {
+                if (ImGui::MenuItem("Open...", "Ctrl+O")) {
+                    std::string p = openDialog(app.hwnd,
+                        "MSX media\0*.dsk;*.dmk;*.di;*.rom;*.mx1;*.mx2;*.cas\0All files\0*.*\0");
+                    if (!p.empty()) openPath(app, p);
+                }
+                bool disk = app.mode == Mode::Disk;
+                if (ImGui::MenuItem("Save image", "Ctrl+S", false, disk)) saveImage(app);
+                if (ImGui::MenuItem("Save image as...", "Ctrl+Shift+S", false, disk)) saveImageAs(app);
+                ImGui::Separator();
+                if (ImGui::MenuItem("Close", nullptr, false, app.mode != Mode::None)) {
+                    app.mode = Mode::None; app.imagePath.clear(); clearSelection(app);
+                    app.status = "Closed.";
+                }
+                if (ImGui::MenuItem("Quit")) running = false;
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Edit")) {
+                bool f = app.selected >= 0 && app.mode == Mode::Disk && !app.listing[app.selected].isDir();
+                if (ImGui::MenuItem("Revert file", nullptr, false, f)) selectFile(app, app.selected);
+                if (ImGui::MenuItem("Delete file", nullptr, false, f)) {
+                    std::string err;
+                    if (app.fs.deleteFile(app.listing[app.selected], &err)) refreshListing(app);
+                }
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Help")) {
+                if (ImGui::MenuItem("Manual", "F1")) app.showManual = true;
+                if (ImGui::MenuItem("About")) app.showAbout = true;
+                ImGui::EndMenu();
+            }
+            // Right-aligned dirty indicator
+            if (app.mode == Mode::Disk && app.disk.dirty()) {
+                ImGui::TextColored(kMod, "   image modified *");
+            }
+            ImGui::EndMenuBar();
+        }
 
         // Path bar
-        ImGui::SetNextItemWidth(-120);
-        ImGui::InputText("##path", app.pathInput, sizeof(app.pathInput));
-        ImGui::SameLine();
-        if (ImGui::Button("Open", ImVec2(110, 0)) && app.pathInput[0])
+        ImGui::SetNextItemWidth(-160);
+        if (ImGui::InputText("##path", app.pathInput, sizeof(app.pathInput),
+                             ImGuiInputTextFlags_EnterReturnsTrue) && app.pathInput[0])
             openPath(app, app.pathInput);
+        ImGui::SameLine();
+        if (ImGui::Button("Open path", ImVec2(150, 0)) && app.pathInput[0]) openPath(app, app.pathInput);
         ImGui::TextDisabled("%s", app.status.c_str());
         ImGui::Separator();
 
         if (app.mode == Mode::Disk) {
-            drawDiskInfoBar(app);
+            // Info strip
+            ImGui::TextDisabled("Format:"); ImGui::SameLine();
+            ImGui::TextColored(kAccent, "%s", to_string(app.disk.format()));
+            ImGui::SameLine(); ImGui::TextDisabled("| Geometry:"); ImGui::SameLine();
+            ImGui::Text("%dc x %dh x %ds", app.disk.cylinders(), app.disk.heads(), app.disk.sectorsPerTrack());
+            if (app.disk.isProtected()) { ImGui::SameLine(); ImGui::TextColored(kWarn, "| PROTECTED"); }
+            if (app.fsMounted) {
+                ImGui::SameLine(); ImGui::TextDisabled("| FAT12:"); ImGui::SameLine();
+                ImGui::Text("OEM '%s'  free %ld KB", app.fs.oemName().c_str(), app.fs.freeBytes()/1024);
+            }
             ImGui::Separator();
-            float leftW = 430.0f;
-            ImGui::BeginChild("left", ImVec2(leftW, 0), true);
+            ImGui::BeginChild("left", ImVec2(440, 0), true);
             drawFileTree(app);
             ImGui::EndChild();
             ImGui::SameLine();
             ImGui::BeginChild("right", ImVec2(0, 0), true);
             drawPreview(app);
             ImGui::EndChild();
-        } else if (app.mode == Mode::Rom) {
-            drawRom(app);
-        } else if (app.mode == Mode::Cas) {
-            drawCas(app);
-        } else {
-            ImGui::TextDisabled("Nothing loaded.");
-            ImGui::Bullet(); ImGui::TextUnformatted("Disk: .dsk, raw, .dmk (protected/RAW-aware)");
-            ImGui::Bullet(); ImGui::TextUnformatted("Cartridge: .rom (.mx1/.mx2)");
-            ImGui::Bullet(); ImGui::TextUnformatted("Tape: .cas");
+        } else if (app.mode == Mode::Rom) drawRom(app);
+        else if (app.mode == Mode::Cas) drawCas(app);
+        else {
+            ImGui::Spacing();
+            ImGui::TextColored(kAccent, "Nothing loaded.");
+            ImGui::TextDisabled("Open a file (File > Open, Ctrl+O, drag & drop, or the path bar).");
+            ImGui::Spacing();
+            ImGui::BulletText("Disk: .dsk, raw, .dmk  (protected/RAW aware, FAT12 read/write)");
+            ImGui::BulletText("Cartridge: .rom (.mx1/.mx2)  -  mapper detection");
+            ImGui::BulletText("Tape: .cas  -  block layout");
+            ImGui::Spacing();
+            ImGui::TextDisabled("See Help > Manual (F1) for what each panel does.");
         }
-
         ImGui::End();
 
+        drawManual(app);
+        drawAbout(app);
+
         ImGui::Render();
-        ImGuiIO& io = ImGui::GetIO();
         glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
-        glClearColor(0.09f, 0.10f, 0.12f, 1.0f);
+        glClearColor(0.07f, 0.08f, 0.10f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         SDL_GL_SwapWindow(win);

@@ -10,8 +10,8 @@ It handles the whole MSX file stack:
 |--------|--------------|
 | **Disk images** | `.dsk` / raw sector dumps, and `.dmk` track images (protected disks). Auto-detects geometry (SS/DS, 360/720 KB). |
 | **Protected / RAW** | A `.dmk` preserves the physical IDAM/sector layout, so copy-protected disks survive: non-standard sector sizes, deleted-data address marks, duplicate IDs and CRC anomalies are surfaced in a **sector inspector**. The logical FAT12 space is reconstructed from the standard sectors, so a normal filesystem is still readable straight out of a protected image. |
-| **FAT12 filesystem** | MSX-DOS disks: boot/BPB, FAT chains, root + subdirectories, volume label, free space, file extraction, and **deleted-entry recovery**. |
-| **MSX files** | Type detection (tokenized BASIC `0xFF`, BLOAD binary `0xFE`, ASCII, data) and a full **BASIC detokenizer** (standard + `0xFF`-extended tokens, hex/oct/int/BCD-float constants, string & REM literal handling). |
+| **FAT12 filesystem** | MSX-DOS disks: boot/BPB, FAT chains, root + subdirectories, volume label, free space, file extraction, **deleted-entry recovery**, and **read/write** (overwrite / grow / shrink with automatic cluster (re)allocation across both FAT copies, delete). |
+| **MSX files** | Type detection (tokenized BASIC `0xFF`, BLOAD binary `0xFE`, ASCII, data), a full **BASIC detokenizer** and an inverse **tokenizer** (edit a listing as text and save it back tokenized). Handles standard + `0xFF`-extended tokens, hex/oct/int/BCD-float constants, line references, string & REM literals. |
 | **Cartridge ROMs** | Size / page count, `AB` header + entry points (INIT/STATEMENT/DEVICE/TEXT), and **mapper detection** (None / Konami / Konami SCC / ASCII8 / ASCII16) via the openMSX-style write-target heuristic. |
 | **Cassette** | `.cas` block layout: header sync, ASCII / Binary / Tokenized-BASIC file blocks with filenames. |
 
@@ -41,7 +41,10 @@ msxforge info    <image>              disk/format/geometry/FAT summary
 msxforge ls      <image> [/PATH] [--deleted]
 msxforge cat     <image> <FILE>       raw bytes to stdout
 msxforge detok   <image> <FILE.BAS>   detokenize BASIC to stdout
+msxforge tok     <text> [out.bas]     tokenize text BASIC (round-trip check)
 msxforge extract <image> <FILE> <out>
+msxforge put     <image> <FILE> <hostfile> [outimage]   overwrite a file
+msxforge del     <image> <FILE> [outimage]              delete a file
 msxforge protect <image>              physical sector / protection inspector
 msxforge rominfo <rom>
 msxforge cas     <cas>
@@ -49,10 +52,17 @@ msxforge cas     <cas>
 
 ## GUI
 
-Drag a `.dsk` / `.dmk` / `.rom` / `.cas` onto the window (or type a path). Browse
-the file tree, view any file as hex, read the detokenized BASIC / BLOAD header,
-identify the ROM mapper, and inspect the physical sector table of protected
-images.
+Drag a `.dsk` / `.dmk` / `.rom` / `.cas` onto the window, use **File > Open**
+(Ctrl+O), or type a path. Then:
+
+- Browse the FAT12 tree (directories in yellow, deleted files in red).
+- **Edit** a file three ways: as a **BASIC listing** (re-tokenized on save), as
+  **text**, or as **hex** (click a byte or use the offset/value poke box;
+  changed bytes highlight yellow).
+- **Import & replace**, **Export to file**, or **Delete** a file.
+- **Save image** / **Save image as** (Ctrl+S / Ctrl+Shift+S) to persist.
+- Inspect the physical sector table of protected images.
+- Built-in **Manual** (Help > Manual / F1) and `(?)` tooltips throughout.
 
 ## Verified against real media
 
@@ -66,16 +76,25 @@ images.
   filesystem (same 61 files, same detokenized BASIC) read through the track
   container — proving the protected/RAW disk path.
 
-## Honest limitations (v1)
+## Editing & write verification
+
+The edit → save → reopen pipeline (identical in CLI and GUI) is verified on real
+media: overwriting a file grows/shrinks its cluster chain byte-exactly, both FAT
+copies stay consistent, and unrelated files keep the same checksum. A BASIC edit
+(change a line + add a line) round-trips through tokenize → write → reopen →
+detokenize, and delete frees clusters and drops the entry.
+
+## Honest limitations
 
 - DMK **CRC verification** is not yet performed (CRC fields are parsed but not
   recomputed); anomaly flags (non-standard size, deleted marks, geometry
   mismatch) are exercised by construction, not yet against a commercial
   copy-protected dump.
-- BASIC **BCD floats** are decoded to a value and formatted with `%g` — readable
-  and numerically correct, but not guaranteed byte-identical to the ROM lister.
-- Writing/editing back to images is **read-only** so far (extraction works;
-  in-place file insert/delete is the next milestone).
+- BASIC **BCD floats** are decoded/encoded numerically — correct in value but not
+  guaranteed byte-identical to the ROM lister's exact rounding.
+- Creating brand-new files / renaming (as opposed to overwrite/delete) and
+  writing back into a `.dmk` container are the next milestones (disk writes
+  target flat `.dsk`/raw today).
 
 ## License / provenance
 

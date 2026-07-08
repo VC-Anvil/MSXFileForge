@@ -245,6 +245,24 @@ bool DiskImage::readSector(long lba, uint8_t out[512]) const {
     return true;
 }
 
+bool DiskImage::writeLogicalSector(long lba, const uint8_t in[512]) {
+    if (lba < 0 || lba >= (long)lba_.size()) return false;
+    long off = lba_[(size_t)lba];
+    if (off < 0 || off + 512 > (long)raw_.size()) return false;
+    memcpy(raw_.data() + off, in, 512);
+    dirty_ = true;
+    return true;
+}
+
+bool DiskImage::save(const std::string& path, std::string* err) const {
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) { if (err) *err = "cannot open for writing"; return false; }
+    size_t n = fwrite(raw_.data(), 1, raw_.size(), f);
+    fclose(f);
+    if (n != raw_.size()) { if (err) *err = "short write"; return false; }
+    return true;
+}
+
 std::string DiskImage::protectionReport() const {
     if (!protectedFlags_) return {};
     int nonStd = 0, deleted = 0, badId = 0, badData = 0, dup = 0;

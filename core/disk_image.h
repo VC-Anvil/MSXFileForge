@@ -54,6 +54,19 @@ public:
     // sector is unmapped (a hole a protected image can legitimately have).
     bool readSector(long lba, uint8_t out[512]) const;
 
+    // Write one logical 512-byte sector back into the container. Returns false
+    // if the sector is out of range or unmapped. Sets the dirty flag.
+    bool writeLogicalSector(long lba, const uint8_t in[512]);
+
+    // Persist the (possibly edited) container bytes to disk.
+    bool save(const std::string& path, std::string* err = nullptr) const;
+    bool dirty() const { return dirty_; }
+    void clearDirty() { dirty_ = false; }
+    void markDirty() { dirty_ = true; }
+
+    // Mutable container bytes (for the raw hex editor). Marks dirty.
+    std::vector<uint8_t>& rawMut() { dirty_ = true; return raw_; }
+
     // Physical sector table (for the protected/RAW inspector).
     const std::vector<SectorInfo>& sectors() const { return sectors_; }
 
@@ -78,6 +91,7 @@ private:
     std::vector<long> lba_;   // lba_[n] = offset of logical sector n, or -1
     int cylinders_ = 0, heads_ = 0, spt_ = 0;
     bool protectedFlags_ = false;
+    bool dirty_ = false;
 };
 
 } // namespace msx

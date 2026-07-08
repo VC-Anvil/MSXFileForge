@@ -34,7 +34,8 @@ struct DirEntry {
 class Fat12 {
 public:
     // Mount the filesystem. Returns false if the boot sector / BPB is not FAT12.
-    bool mount(const DiskImage& disk, std::string* err = nullptr);
+    // Takes a non-const image so files can be written back in place.
+    bool mount(DiskImage& disk, std::string* err = nullptr);
     bool mounted() const { return mounted_; }
 
     // BPB-derived facts.
@@ -53,7 +54,24 @@ public:
     // Read a file's bytes by following its cluster chain (clamped to size).
     std::vector<uint8_t> readFile(const DirEntry& e) const;
 
+    // ---- Write support ----
+    // Overwrite a file's contents, growing/shrinking its cluster chain as
+    // needed. Updates both FAT copies and the directory entry size. `e` is
+    // updated in place (size, startCluster). Returns false (with err) if there
+    // is not enough free space. The change lives in the in-memory image; call
+    // DiskImage::save() to persist. Re-list the directory afterwards.
+    bool writeFile(DirEntry& e, const std::vector<uint8_t>& data, std::string* err = nullptr);
+
+    // Mark a file deleted (0xE5) and free its clusters. Re-list afterwards.
+    bool deleteFile(const DirEntry& e, std::string* err = nullptr);
+
 private:
+    bool writeByteAt(long imageOffset, uint8_t value);
+    bool readByteAt(long imageOffset, uint8_t& out) const;
+    void setFatEntry(int cluster, int value);   // writes all FAT copies
+    int  allocCluster();                         // first free cluster, or -1
+    std::vector<int> chainOf(int startCluster) const;
+    bool writeClusterData(int cluster, const uint8_t* src, long len);
     std::vector<DirEntry> readDirAtCluster(int cluster, bool includeDeleted) const;
     std::vector<DirEntry> readRootDir(bool includeDeleted) const;
     int fatEntry(int cluster) const;
@@ -62,7 +80,7 @@ private:
     static std::vector<DirEntry> parseEntries(const std::vector<uint8_t>& buf,
                                               long baseOffset, bool includeDeleted);
 
-    const DiskImage* disk_ = nullptr;
+    DiskImage* disk_ = nullptr;
     bool mounted_ = false;
     int bps_ = 512, spc_ = 2, rsvd_ = 1, nfat_ = 2, ndir_ = 112;
     int totalSectors_ = 0, spf_ = 3, totalClusters_ = 0;

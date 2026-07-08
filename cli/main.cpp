@@ -17,6 +17,16 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#if defined(_WIN32)
+#include <io.h>
+#include <fcntl.h>
+#endif
+
+static void setStdoutBinary() {
+#if defined(_WIN32)
+    setmode(fileno(stdout), O_BINARY); // stop \n -> \r\n mangling on raw output
+#endif
+}
 
 using namespace msx;
 
@@ -105,6 +115,7 @@ static int cmd_cat(int argc, char** argv, bool detok) {
         std::string txt = detokenizeBasic(data);
         fwrite(txt.data(), 1, txt.size(), stdout);
     } else {
+        setStdoutBinary();
         fwrite(data.data(), 1, data.size(), stdout);
     }
     return 0;
@@ -150,6 +161,60 @@ static int cmd_protect(const char* img) {
     return 0;
 }
 
+static int cmd_put(int argc, char** argv) {
+    // put <image> <FILE> <hostfile> [outimage]
+    if (argc < 5) { fprintf(stderr, "need <image> <FILE> <hostfile> [outimage]\n"); return 1; }
+    DiskImage dk; Fat12 fs;
+    int rc = mountDisk(argv[2], dk, fs); if (rc) return rc;
+    auto root = fs.list("/", false);
+    DirEntry* e = nullptr;
+    std::string want = argv[3]; for (auto& c : want) c = (char)toupper((unsigned char)c);
+    for (auto& d : root) {
+        std::string nm = d.name; for (auto& c : nm) c = (char)toupper((unsigned char)c);
+        if (nm == want) { e = &d; break; }
+    }
+    if (!e) { fprintf(stderr, "file not found: %s\n", argv[3]); return 4; }
+    auto data = slurp(argv[4]);
+    std::string err;
+    if (!fs.writeFile(*e, data, &err)) { fprintf(stderr, "write: %s\n", err.c_str()); return 6; }
+    const char* out = (argc >= 6) ? argv[5] : argv[2];
+    if (!dk.save(out, &err)) { fprintf(stderr, "save: %s\n", err.c_str()); return 7; }
+    printf("wrote %zu bytes into %s (start cl=%u) -> %s\n",
+           data.size(), e->name.c_str(), e->startCluster, out);
+    return 0;
+}
+
+static int cmd_del(int argc, char** argv) {
+    if (argc < 4) { fprintf(stderr, "need <image> <FILE> [outimage]\n"); return 1; }
+    DiskImage dk; Fat12 fs;
+    int rc = mountDisk(argv[2], dk, fs); if (rc) return rc;
+    auto root = fs.list("/", false);
+    const DirEntry* e = findEntry(fs, argv[3], root);
+    if (!e) { fprintf(stderr, "file not found: %s\n", argv[3]); return 4; }
+    std::string err;
+    if (!fs.deleteFile(*e, &err)) { fprintf(stderr, "delete: %s\n", err.c_str()); return 6; }
+    const char* out = (argc >= 5) ? argv[4] : argv[2];
+    if (!dk.save(out, &err)) { fprintf(stderr, "save: %s\n", err.c_str()); return 7; }
+    printf("deleted %s -> %s\n", argv[3], out);
+    return 0;
+}
+
+static int cmd_tok(int argc, char** argv) {
+    // tok <textfile>  -> tokenize then detokenize (round-trip check)
+    if (argc < 3) { fprintf(stderr, "need <textfile>\n"); return 1; }
+    auto d = slurp(argv[2]);
+    std::string text((const char*)d.data(), d.size());
+    auto toks = tokenizeBasic(text);
+    if (argc >= 4) { // tok <text> <out.bas> : write tokenized file
+        FILE* o = fopen(argv[3], "wb");
+        if (o) { fwrite(toks.data(),1,toks.size(),o); fclose(o); }
+        fprintf(stderr, "tokenized %zu bytes -> %s\n", toks.size(), argv[3]);
+    }
+    std::string back = detokenizeBasic(toks);
+    fwrite(back.data(), 1, back.size(), stdout);
+    return 0;
+}
+
 static int cmd_rominfo(const char* path) {
     auto d = slurp(path);
     if (d.empty()) { fprintf(stderr, "cannot read %s\n", path); return 2; }
@@ -192,6 +257,9 @@ int main(int argc, char** argv) {
     if (cmd == "detok")   return cmd_cat(argc, argv, true);
     if (cmd == "extract") return cmd_extract(argc, argv);
     if (cmd == "protect") return cmd_protect(argv[2]);
+    if (cmd == "put")     return cmd_put(argc, argv);
+    if (cmd == "del")     return cmd_del(argc, argv);
+    if (cmd == "tok")     return cmd_tok(argc, argv);
     if (cmd == "rominfo") return cmd_rominfo(argv[2]);
     if (cmd == "cas")     return cmd_cas(argv[2]);
     fprintf(stderr, "unknown command: %s\n", cmd.c_str());

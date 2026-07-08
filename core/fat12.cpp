@@ -50,7 +50,7 @@ bool Fat12::sectorBytes(long lba, uint8_t out[512]) const {
     return disk_ && disk_->readSector(lba, out);
 }
 
-bool Fat12::mount(const DiskImage& disk, std::string* err) {
+bool Fat12::mount(DiskImage& disk, std::string* err) {
     disk_ = &disk;
     mounted_ = false;
     uint8_t b[512];
@@ -236,6 +236,137 @@ long Fat12::freeBytes() const {
     for (int c = 2; c < totalClusters_ + 2; ++c)
         if (fatEntry(c) == 0) freeCl++;
     return freeCl * spc_ * 512;
+}
+
+// ---- Write support --------------------------------------------------------
+
+bool Fat12::readByteAt(long off, uint8_t& out) const {
+    long lba = off / 512; int within = (int)(off % 512);
+    uint8_t sec[512];
+    if (!disk_ || !disk_->readSector(lba, sec)) return false;
+    out = sec[within];
+    return true;
+}
+
+bool Fat12::writeByteAt(long off, uint8_t value) {
+    long lba = off / 512; int within = (int)(off % 512);
+    uint8_t sec[512];
+    if (!disk_ || !disk_->readSector(lba, sec)) return false;
+    sec[within] = value;
+    return disk_->writeLogicalSector(lba, sec);
+}
+
+void Fat12::setFatEntry(int cluster, int value) {
+    value &= 0xFFF;
+    for (int f = 0; f < nfat_; ++f) {
+        long base = (fatStartSec_ + (long)f * spf_) * 512;
+        long o = base + cluster + cluster / 2;
+        uint8_t lo, hi;
+        if (!readByteAt(o, lo)) continue;
+        if (!readByteAt(o + 1, hi)) continue;
+        uint16_t v = (uint16_t)(lo | (hi << 8));
+        if (cluster & 1) v = (uint16_t)((v & 0x000F) | (value << 4));
+        else             v = (uint16_t)((v & 0xF000) | value);
+        writeByteAt(o, (uint8_t)(v & 0xFF));
+        writeByteAt(o + 1, (uint8_t)(v >> 8));
+    }
+}
+
+int Fat12::allocCluster() {
+    for (int c = 2; c < totalClusters_ + 2; ++c)
+        if (fatEntry(c) == 0) return c;
+    return -1;
+}
+
+std::vector<int> Fat12::chainOf(int startCluster) const {
+    std::vector<int> chain;
+    int c = startCluster, guard = 0;
+    while (c >= 2 && c < 0xFF8 && guard++ < totalClusters_ + 8) {
+        chain.push_back(c);
+        c = fatEntry(c);
+    }
+    return chain;
+}
+
+bool Fat12::writeClusterData(int cluster, const uint8_t* src, long len) {
+    long firstSec = dataStartSec_ + (long)(cluster - 2) * spc_;
+    for (int s = 0; s < spc_; ++s) {
+        uint8_t sec[512];
+        long chunk = len - (long)s * 512;
+        if (chunk >= 512) {
+            memcpy(sec, src + (long)s * 512, 512);
+        } else if (chunk > 0) {
+            memcpy(sec, src + (long)s * 512, chunk);
+            memset(sec + chunk, 0, 512 - chunk);
+        } else {
+            memset(sec, 0, 512);
+        }
+        if (!disk_->writeLogicalSector(firstSec + s, sec)) return false;
+    }
+    return true;
+}
+
+bool Fat12::writeFile(DirEntry& e, const std::vector<uint8_t>& data, std::string* err) {
+    if (!mounted_) { if (err) *err = "not mounted"; return false; }
+    if (e.isDir()) { if (err) *err = "cannot overwrite a directory"; return false; }
+
+    long clusterBytes = (long)spc_ * 512;
+    int needClusters = data.empty() ? 0 : (int)((data.size() + clusterBytes - 1) / clusterBytes);
+
+    std::vector<int> have = (e.startCluster >= 2) ? chainOf(e.startCluster) : std::vector<int>{};
+
+    // Grow the chain if needed by allocating free clusters.
+    std::vector<int> chain = have;
+    if ((int)chain.size() < needClusters) {
+        // Temporarily reserve as we go so allocCluster doesn't return dupes.
+        int extra = needClusters - (int)chain.size();
+        for (int i = 0; i < extra; ++i) {
+            int nc = allocCluster();
+            if (nc < 0) { if (err) *err = "disk full (no free clusters)"; return false; }
+            setFatEntry(nc, 0xFFF); // reserve immediately
+            chain.push_back(nc);
+        }
+    }
+
+    // Write the payload across the (first needClusters) clusters.
+    for (int i = 0; i < needClusters; ++i) {
+        long off = (long)i * clusterBytes;
+        long len = (long)data.size() - off; if (len > clusterBytes) len = clusterBytes;
+        if (!writeClusterData(chain[i], data.data() + off, len)) {
+            if (err) *err = "write error"; return false;
+        }
+    }
+
+    // Relink the FAT: chain[0..need-1] linked, last -> EOF; free the rest.
+    for (int i = 0; i < needClusters; ++i) {
+        int next = (i + 1 < needClusters) ? chain[i + 1] : 0xFFF;
+        setFatEntry(chain[i], next);
+    }
+    for (size_t i = needClusters; i < chain.size(); ++i)
+        setFatEntry(chain[i], 0); // free surplus (both old chain tail + over-alloc)
+
+    // Update the directory entry (size + start cluster).
+    uint16_t newStart = (needClusters > 0) ? (uint16_t)chain[0] : 0;
+    uint32_t newSize = (uint32_t)data.size();
+    if (e.entryOffset >= 0) {
+        writeByteAt(e.entryOffset + 0x1A, (uint8_t)(newStart & 0xFF));
+        writeByteAt(e.entryOffset + 0x1B, (uint8_t)(newStart >> 8));
+        writeByteAt(e.entryOffset + 0x1C, (uint8_t)(newSize & 0xFF));
+        writeByteAt(e.entryOffset + 0x1D, (uint8_t)((newSize >> 8) & 0xFF));
+        writeByteAt(e.entryOffset + 0x1E, (uint8_t)((newSize >> 16) & 0xFF));
+        writeByteAt(e.entryOffset + 0x1F, (uint8_t)((newSize >> 24) & 0xFF));
+    }
+    e.startCluster = newStart;
+    e.size = newSize;
+    return true;
+}
+
+bool Fat12::deleteFile(const DirEntry& e, std::string* err) {
+    if (!mounted_) { if (err) *err = "not mounted"; return false; }
+    if (e.isDir()) { if (err) *err = "refusing to delete a directory"; return false; }
+    for (int c : chainOf(e.startCluster)) setFatEntry(c, 0);
+    if (e.entryOffset >= 0) writeByteAt(e.entryOffset, 0xE5); // mark deleted
+    return true;
 }
 
 } // namespace msx

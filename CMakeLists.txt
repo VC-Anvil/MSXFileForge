@@ -33,7 +33,8 @@ find_package(OpenGL REQUIRED)
 target_link_libraries(msxforge-gui PRIVATE
   msxcore
   ${CMAKE_SOURCE_DIR}/libs/SDL2/lib/SDL2.dll
-  OpenGL::GL)
+  OpenGL::GL
+  comdlg32)
 
 add_custom_command(TARGET msxforge-gui POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
