@@ -19,8 +19,20 @@ target_link_libraries(msxforge PRIVATE msxcore)
 
 # --- dsk2dmk test tool ---
 add_executable(dsk2dmk tools/dsk2dmk.cpp)
+target_link_libraries(dsk2dmk PRIVATE msxcore)
+
+# --- tests (core library, no GUI deps): ctest --test-dir build ---
+option(MSXFF_BUILD_TESTS "Build the core test suite" ON)
+if(MSXFF_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
+endif()
 
 # --- GUI (Dear ImGui + SDL2 + OpenGL3 + tinyfiledialogs) ---
+# Turn off with -DMSXFF_BUILD_GUI=OFF to build only the core, CLI and tests
+# (no SDL2 / OpenGL needed: handy for headless CI and servers).
+option(MSXFF_BUILD_GUI "Build the Dear ImGui desktop app" ON)
+if(MSXFF_BUILD_GUI)
 set(IMGUI ${CMAKE_SOURCE_DIR}/libs/imgui)
 add_executable(msxforge-gui
   gui/main.cpp
@@ -56,3 +68,4 @@ else()
     target_link_libraries(msxforge-gui PRIVATE ${SDL2_LIBRARIES})
   endif()
 endif()
+endif() # MSXFF_BUILD_GUI

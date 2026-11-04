@@ -26,6 +26,16 @@ enum class DiskFormat { Unknown, DSK_Plain, RAW, DMK, HDD };
 
 const char* to_string(DiskFormat f);
 
+// CRC-16/CCITT as used by the WD279x/uPD765 FDCs for ID and data fields.
+// Pass 0xCDB4 as `crc` to account for the three MFM 0xA1 sync bytes.
+uint16_t crc16Ccitt(const uint8_t* p, size_t n, uint16_t crc = 0xFFFF);
+
+// Re-encode a flat .dsk (360/720KB, 8 or 9 sectors per track) as a DMK image
+// with a standard IBM MFM track layout (gaps, 0xA1 syncs, valid ID and data
+// CRCs). Geometry comes from the BPB, else from the image size. Returns an
+// empty vector (and sets err) if the geometry cannot be determined.
+std::vector<uint8_t> dskToDmk(const std::vector<uint8_t>& dsk, std::string* err = nullptr);
+
 // Physical description of one sector as it was found on the medium.
 struct SectorInfo {
     int  cyl = 0, head = 0, sec = 0;   // CHS id as recorded in the IDAM
@@ -35,13 +45,20 @@ struct SectorInfo {
     bool deleted = false;              // deleted-data address mark (protection)
     bool idCrcError = false;
     bool dataCrcError = false;
+    bool duplicateId = false;          // same C/H/R appears twice on the track
     bool nonStandard = false;          // size!=512, dup id, or otherwise irregular
     long lba = -1;                     // logical block assigned, or -1 if unmapped
+    long markOffset = -1;              // DMK: data address mark byte (CRC covers it)
+    bool mfm = false;                  // DMK: double density (CRC preset 0xCDB4)
 };
 
 class DiskImage {
 public:
     bool load(const std::string& path, std::string* err = nullptr);
+    // Same as load() but from bytes already in memory. `nameHint` is only used
+    // for its extension (".dmk" selects the track-image parser).
+    bool loadBytes(std::vector<uint8_t> bytes, const std::string& nameHint,
+                   std::string* err = nullptr);
 
     bool loaded() const { return !raw_.empty(); }
     DiskFormat format() const { return format_; }
@@ -94,6 +111,7 @@ private:
     std::vector<uint8_t> raw_;
     std::vector<SectorInfo> sectors_;
     std::vector<long> lba_;   // lba_[n] = offset of logical sector n, or -1
+    std::vector<int> lbaSector_; // lbaSector_[n] = index into sectors_, or -1
     int cylinders_ = 0, heads_ = 0, spt_ = 0;
     bool protectedFlags_ = false;
     bool dirty_ = false;

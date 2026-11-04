@@ -57,6 +57,13 @@ jobs:
         shell: bash
         run: cmake --build build --config Release -j 3
 
+      # The x86_64 macOS build is cross-compiled on an arm64 runner, so its
+      # test binary cannot run there; every other build runs the suite.
+      - name: Test
+        if: matrix.mac_arch != 'x86_64'
+        shell: bash
+        run: ctest --test-dir build -C Release --output-on-failure
+
       - name: Verify arch (macOS)
         if: runner.os == 'macOS'
         run: |

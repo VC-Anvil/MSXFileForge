@@ -665,6 +665,20 @@ static void drawFileTree(App& a) {
         a.nameBuf[sizeof a.nameBuf - 1] = 0; a.openRename = true;
     }
     if (!canRename) ImGui::EndDisabled();
+    if (a.cwd != "/") {
+        ImGui::SameLine();
+        if (ImGui::Button("Remove this folder")) {
+            DirEntry dir; std::string err;
+            if (!a.fs.lookup(a.cwd, dir)) a.status = "Remove failed: folder not found";
+            else if (a.fs.removeDir(dir, &err)) {
+                a.status = "Removed folder " + a.cwd + " (image modified)";
+                size_t slash = a.cwd.find_last_of('/');
+                a.cwd = (slash == 0 || slash == std::string::npos) ? "/" : a.cwd.substr(0, slash);
+                refreshListing(a);
+            } else a.status = "Remove failed: " + err;
+        }
+        help("Delete the folder you are in. It must be empty (only . and ..). Save the image to persist.");
+    }
     ImGui::Separator();
 
     // Modals.

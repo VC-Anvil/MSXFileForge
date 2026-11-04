@@ -138,6 +138,13 @@ std::vector<uint8_t> tsxToCas(const std::vector<uint8_t>& t, std::string* err) {
             case 0x12: skip = 4; break;                                                        // pure tone
             case 0x13: if (p>=t.size()) return cas; skip = 1 + t[p]*2; break;                  // pulse seq
             case 0x14: if (p+10>t.size()) return cas; skip = 10 + (t[p+7]|(t[p+8]<<8)|(t[p+9]<<16)); break; // pure data
+            case 0x15: if (p+8>t.size()) return cas; skip = 8 + (t[p+5]|(t[p+6]<<8)|(t[p+7]<<16)); break;  // direct recording
+            case 0x18: case 0x19: if (p+4>t.size()) return cas; skip = 4 + rd32(&t[p]); break;     // CSW / generalized
+            case 0x23: skip = 2; break;                                                        // jump
+            case 0x26: if (p+2>t.size()) return cas; skip = 2 + 2 * rd16(&t[p]); break;        // call sequence
+            case 0x27: skip = 0; break;                                                        // return
+            case 0x28: if (p+2>t.size()) return cas; skip = 2 + rd16(&t[p]); break;            // select
+            case 0x2B: if (p+4>t.size()) return cas; skip = 4 + rd32(&t[p]); break;            // signal level
             case 0x20: skip = 2; break;                                                        // pause
             case 0x21: if (p>=t.size()) return cas; skip = 1 + t[p]; break;                    // group start
             case 0x22: skip = 0; break;                                                        // group end
@@ -154,6 +161,7 @@ std::vector<uint8_t> tsxToCas(const std::vector<uint8_t>& t, std::string* err) {
                 if (err) *err = "unknown TSX block ID 0x" + std::string(1, "0123456789ABCDEF"[(id>>4)&0xF]) + std::string(1, "0123456789ABCDEF"[id&0xF]);
                 return cas;
         }
+        if (p + skip > t.size()) { if (err) *err = "truncated TSX block"; return cas; }
         p += skip;
     }
     return cas;
