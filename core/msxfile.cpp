@@ -90,29 +90,98 @@ static const char* extTokenText(uint8_t b) {
     return nullptr;
 }
 
-// Decode a Microsoft/MSX BCD float. mant = number of mantissa bytes (3=single,
-// 7=double). Returns the value as a double; caller formats it.
-static double decodeBcd(const uint8_t* p, int mantBytes) {
-    uint8_t expByte = p[0];
-    if (expByte == 0) return 0.0;
-    bool neg = (expByte & 0x80) != 0;
-    int exp = (expByte & 0x7F) - 0x40;
-    double mant = 0.0, scale = 0.1;
+// ---- Numeric constants ----------------------------------------------------
+//
+// MSX-BASIC stores real constants as BCD: one exponent byte (bit 7 = sign,
+// bits 0-6 = power of ten + 0x40, value = 0.d1d2d3... x 10^exp) followed by 3
+// (single precision, 6 digits, token 0x1D) or 7 (double, 14 digits, token
+// 0x1F) mantissa bytes, two digits per byte. Conversion goes through decimal
+// digit strings, never binary floating point, so it is exact both ways.
+
+namespace {
+
+struct DecNum {           // value = 0.digits x 10^exp ("" == zero)
+    std::string digits;   // no leading/trailing zeros
+    int exp = 0;
+    bool neg = false;
+};
+
+DecNum bcdToDec(const uint8_t* p, int mantBytes) {
+    DecNum n;
+    if (p[0] == 0) return n;
+    n.neg = (p[0] & 0x80) != 0;
+    n.exp = (p[0] & 0x7F) - 0x40;
     for (int i = 1; i <= mantBytes; ++i) {
-        int hi = (p[i] >> 4) & 0xF, lo = p[i] & 0xF;
-        mant += hi * scale; scale *= 0.1;
-        mant += lo * scale; scale *= 0.1;
+        n.digits += (char)('0' + ((p[i] >> 4) % 10));
+        n.digits += (char)('0' + ((p[i] & 0xF) % 10));
     }
-    double v = mant * std::pow(10.0, exp);
-    return neg ? -v : v;
+    size_t lead = n.digits.find_first_not_of('0');
+    if (lead == std::string::npos) return DecNum{};
+    n.exp -= (int)lead;
+    n.digits.erase(0, lead);
+    while (!n.digits.empty() && n.digits.back() == '0') n.digits.pop_back();
+    return n;
 }
 
-static void appendNumber(std::string& out, double v, bool integral) {
-    char buf[64];
-    if (integral) { snprintf(buf, sizeof buf, "%.0f", v); out += buf; return; }
-    snprintf(buf, sizeof buf, "%.9g", v);
-    out += buf;
+// Round to `maxDigits` significant digits (half up) and pack into p[0..mant].
+void decToBcd(DecNum n, int mantBytes, uint8_t* p) {
+    int maxDigits = mantBytes * 2;
+    memset(p, 0, (size_t)mantBytes + 1);
+    if (n.digits.empty()) return;
+    if ((int)n.digits.size() > maxDigits) {
+        bool up = n.digits[(size_t)maxDigits] >= '5';
+        n.digits.resize((size_t)maxDigits);
+        for (int i = maxDigits - 1; up && i >= 0; --i) {
+            if (n.digits[(size_t)i] == '9') n.digits[(size_t)i] = '0';
+            else { n.digits[(size_t)i]++; up = false; }
+        }
+        if (up) { n.digits.insert(n.digits.begin(), '1'); n.digits.pop_back(); n.exp++; }
+    }
+    if (n.exp > 63) { n.exp = 63; n.digits = std::string((size_t)maxDigits, '9'); } // overflow: clamp
+    if (n.exp < -63) return;                                                     // underflow: zero
+    n.digits.resize((size_t)maxDigits, '0');
+    p[0] = (uint8_t)((n.exp + 0x40) | (n.neg ? 0x80 : 0));
+    for (int i = 0; i < mantBytes; ++i)
+        p[i + 1] = (uint8_t)(((n.digits[(size_t)i * 2] - '0') << 4) | (n.digits[(size_t)i * 2 + 1] - '0'));
 }
+
+// Format the way a listing should show it so that re-tokenizing gives the same
+// bytes: no leading zero (".5"), single precision marked with '!' (or an 'E'
+// exponent), double precision with a 'D' exponent, or '#' when it would
+// otherwise read back as an integer.
+std::string formatReal(const DecNum& n, bool dbl) {
+    const int maxDigits = dbl ? 14 : 6;
+    std::string s;
+    if (n.neg) s += '-';
+    if (n.digits.empty()) return s + (dbl ? "0#" : "0!");
+    const std::string& d = n.digits;
+    int len = (int)d.size();
+    bool fixed = (n.exp >= 1 && n.exp <= maxDigits) ||
+                 (n.exp <= 0 && -n.exp + len <= maxDigits && n.exp >= -(maxDigits - 1));
+    if (fixed) {
+        if (n.exp <= 0) {
+            s += '.'; s.append((size_t)-n.exp, '0'); s += d;
+        } else if (len <= n.exp) {
+            s += d; s.append((size_t)(n.exp - len), '0');
+        } else {
+            s += d.substr(0, (size_t)n.exp); s += '.'; s += d.substr((size_t)n.exp);
+        }
+        bool hasPoint = s.find('.') != std::string::npos;
+        if (!dbl) s += '!';
+        else if (!hasPoint) {                       // would it read back as an integer?
+            std::string mag = n.neg ? s.substr(1) : s;
+            if (mag.size() < 5 || (mag.size() == 5 && mag <= "32767")) s += '#';
+        }
+        return s;
+    }
+    s += d[0];
+    if (len > 1) { s += '.'; s += d.substr(1); }
+    int e = n.exp - 1;
+    char buf[16]; snprintf(buf, sizeof buf, "%c%c%02d", dbl ? 'D' : 'E', e < 0 ? '-' : '+', e < 0 ? -e : e);
+    return s + buf;
+}
+
+} // namespace
 
 std::string detokenizeBasic(const std::vector<uint8_t>& d) {
     std::string out;
@@ -126,7 +195,7 @@ std::string detokenizeBasic(const std::vector<uint8_t>& d) {
         char num[16]; snprintf(num, sizeof num, "%u ", lineNo);
         out += num;
 
-        bool inString = false, restLiteral = false;
+        bool inString = false, restLiteral = false, inData = false;
         while (pos < d.size()) {
             uint8_t b = d[pos];
             if (b == 0x00) { pos++; break; } // end of line
@@ -138,6 +207,16 @@ std::string detokenizeBasic(const std::vector<uint8_t>& d) {
                 continue;
             }
             if (b == '"') { inString = true; out += '"'; pos++; continue; }
+            if (inData) {                     // DATA items are stored verbatim
+                if (b == ':') inData = false;
+                out += (char)b; pos++; continue;
+            }
+
+            // ELSE is stored as ":" ELSE and ' as ":" REM "'"; LIST hides the colon.
+            if (b == ':' && pos + 1 < d.size() && d[pos+1] == 0xA1) { pos++; continue; }
+            if (b == ':' && pos + 2 < d.size() && d[pos+1] == 0x8F && d[pos+2] == 0xE6) {
+                out += '\''; pos += 3; restLiteral = true; continue;
+            }
 
             // Embedded numeric constants.
             if (b == 0x0B && pos + 2 < d.size()) { // octal
@@ -162,11 +241,11 @@ std::string detokenizeBasic(const std::vector<uint8_t>& d) {
                 int16_t v = (int16_t)(d[pos+1] | (d[pos+2] << 8));
                 out += std::to_string((int)v); pos += 3; continue;
             }
-            if (b == 0x1D && pos + 4 < d.size()) { // single float (BCD)
-                appendNumber(out, decodeBcd(&d[pos+1], 3), false); pos += 5; continue;
+            if (b == 0x1D && pos + 4 < d.size()) { // single precision (BCD)
+                out += formatReal(bcdToDec(&d[pos+1], 3), false); pos += 5; continue;
             }
-            if (b == 0x1F && pos + 8 < d.size()) { // double float (BCD)
-                appendNumber(out, decodeBcd(&d[pos+1], 7), false); pos += 9; continue;
+            if (b == 0x1F && pos + 8 < d.size()) { // double precision (BCD)
+                out += formatReal(bcdToDec(&d[pos+1], 7), true); pos += 9; continue;
             }
 
             // Keyword tokens.
@@ -180,6 +259,7 @@ std::string detokenizeBasic(const std::vector<uint8_t>& d) {
                 if (kw) {
                     out += kw;
                     if (b == 0x8F || b == 0xE6) restLiteral = true; // REM / '
+                    if (b == 0x84) inData = true;                   // DATA
                     pos++;
                     continue;
                 }
@@ -190,7 +270,6 @@ std::string detokenizeBasic(const std::vector<uint8_t>& d) {
             pos++;
         }
         out += '\n';
-        pos = pos; // link is advisory; we stream sequentially
     }
     return out;
 }
@@ -292,7 +371,7 @@ const std::vector<Kw>& keywordList() {
             if (t) v.push_back({t, (uint8_t)b, true});
         }
         v.push_back({"?", 0x91, false}); // ? is PRINT
-        std::sort(v.begin(), v.end(), [](const Kw& a, const Kw& b) {
+        std::stable_sort(v.begin(), v.end(), [](const Kw& a, const Kw& b) {
             return a.text.size() > b.text.size();
         });
         return v;
@@ -300,31 +379,77 @@ const std::vector<Kw>& keywordList() {
     return kws;
 }
 
-// Encode a Microsoft/MSX BCD double (7 mantissa bytes) into out[8].
-void encodeBcdDouble(double v, uint8_t out[8]) {
-    memset(out, 0, 8);
-    if (v == 0.0) return;
-    bool neg = v < 0; if (neg) v = -v;
-    int exp = (int)std::floor(std::log10(v)) + 1; // v = mant * 10^exp, mant in [0.1,1)
-    double mant = v / std::pow(10.0, exp);
-    // Guard rounding that can push mant to 1.0
-    if (mant >= 1.0) { mant /= 10.0; exp++; }
-    out[0] = (uint8_t)((exp + 0x40) | (neg ? 0x80 : 0));
-    for (int i = 1; i <= 7; ++i) {
-        int hi = (int)(mant * 10); mant = mant * 10 - hi;
-        int lo = (int)(mant * 10); mant = mant * 10 - lo;
-        out[i] = (uint8_t)((hi << 4) | lo);
-    }
-}
-
 bool isJumpToken(uint8_t code) { // integers after these are line numbers
     switch (code) {
         case 0x89: case 0x8D: case 0xDA: case 0xA1: // GOTO GOSUB THEN ELSE
         case 0x8C: case 0x8A: case 0xA9: case 0xAA: // RESTORE RUN AUTO RENUM
-        case 0x93: case 0xA8:                       // LIST DELETE
+        case 0x93: case 0xA8: case 0xA7: case 0x8E: // LIST DELETE RESUME RETURN
             return true;
     }
     return false;
+}
+
+bool isDigit(char c) { return c >= '0' && c <= '9'; }
+bool isAlpha(char c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); }
+
+// Parse a decimal number at ln[i]: digits, optional '.', optional E/D
+// exponent (only when digits follow), optional type suffix ! # %.
+struct ParsedNum {
+    DecNum dec;
+    bool hasPoint = false;
+    char expChar = 0;          // 'E' or 'D' if an exponent was given
+    char suffix = 0;           // '!' '#' '%' or 0
+    bool integral = false;     // no point, no exponent
+    double approx = 0;         // only for range checks
+};
+
+size_t parseNumber(const std::string& ln, size_t i, ParsedNum& n) {
+    size_t m = ln.size();
+    std::string digits;
+    int pointPos = -1;
+    while (i < m && (isDigit(ln[i]) || (ln[i] == '.' && pointPos < 0))) {
+        if (ln[i] == '.') pointPos = (int)digits.size();
+        else digits += ln[i];
+        i++;
+    }
+    n.hasPoint = pointPos >= 0;
+    if (pointPos < 0) pointPos = (int)digits.size();
+    int exp10 = 0;
+    if (i < m && (ln[i] == 'E' || ln[i] == 'e' || ln[i] == 'D' || ln[i] == 'd')) {
+        size_t j = i + 1;
+        bool negE = false;
+        if (j < m && (ln[j] == '+' || ln[j] == '-')) { negE = ln[j] == '-'; j++; }
+        if (j < m && isDigit(ln[j])) {
+            n.expChar = (char)toupper((unsigned char)ln[i]);
+            int e = 0;
+            while (j < m && isDigit(ln[j])) { if (e < 1000) e = e * 10 + (ln[j] - '0'); j++; }
+            exp10 = negE ? -e : e;
+            i = j;
+        }
+    }
+    if (i < m && (ln[i] == '!' || ln[i] == '#' || ln[i] == '%')) n.suffix = ln[i++];
+    n.integral = !n.hasPoint && !n.expChar;
+
+    size_t lead = digits.find_first_not_of('0');
+    if (lead == std::string::npos) { n.dec = DecNum{}; n.approx = 0; return i; }
+    n.dec.exp = pointPos - (int)lead + exp10;
+    n.dec.digits = digits.substr(lead);
+    while (!n.dec.digits.empty() && n.dec.digits.back() == '0') n.dec.digits.pop_back();
+    n.approx = atof(("0." + n.dec.digits).c_str()) * std::pow(10.0, n.dec.exp);
+    return i;
+}
+
+void emitReal(std::vector<uint8_t>& body, const DecNum& dec, bool dbl) {
+    uint8_t b[8];
+    decToBcd(dec, dbl ? 7 : 3, b);
+    body.push_back(dbl ? 0x1F : 0x1D);
+    body.insert(body.end(), b, b + (dbl ? 8 : 4));
+}
+
+void emitInt(std::vector<uint8_t>& body, long v) {
+    if (v >= 0 && v <= 9) body.push_back((uint8_t)(0x11 + v));
+    else if (v >= 10 && v <= 255) { body.push_back(0x0F); body.push_back((uint8_t)v); }
+    else { body.push_back(0x1C); body.push_back(v & 0xFF); body.push_back((v >> 8) & 0xFF); }
 }
 } // namespace
 
@@ -341,115 +466,124 @@ std::vector<uint8_t> tokenizeBasic(const std::string& text) {
         size_t eol = text.find('\n', p);
         std::string ln = text.substr(p, (eol == std::string::npos ? n : eol) - p);
         p = (eol == std::string::npos) ? n : eol + 1;
-        // strip trailing CR
         if (!ln.empty() && ln.back() == '\r') ln.pop_back();
         size_t i = 0, m = ln.size();
         while (i < m && ln[i] == ' ') i++;
-        if (i >= m) continue;               // blank line
-        if (!isdigit((unsigned char)ln[i])) continue; // no line number -> skip
+        if (i >= m) continue;                       // blank line
+        if (!isDigit(ln[i])) continue;              // no line number -> skip
         long no = 0;
-        while (i < m && isdigit((unsigned char)ln[i])) no = no * 10 + (ln[i++] - '0');
-        while (i < m && ln[i] == ' ') i++;
+        while (i < m && isDigit(ln[i])) { no = no * 10 + (ln[i++] - '0'); if (no > 99999) no = 99999; }
+        if (no > 65529) continue;                   // not a valid MSX line number
+        if (i < m && ln[i] == ' ') i++;             // the separator LIST prints
 
         Line L; L.no = (uint16_t)no;
-        bool lineRef = false;
+        bool lineRef = false;   // integers are line numbers (after GOTO etc.)
+        bool inIdent = false;   // inside a variable name: digits stay ASCII
         while (i < m) {
             char c = ln[i];
-            // String literal
+            // String literal (stored verbatim, closing quote optional).
             if (c == '"') {
                 L.body.push_back('"'); i++;
                 while (i < m && ln[i] != '"') L.body.push_back((uint8_t)ln[i++]);
                 if (i < m) { L.body.push_back('"'); i++; }
-                lineRef = false;
+                lineRef = inIdent = false;
                 continue;
             }
-            // Keyword / operator match (longest first, case-insensitive)
+            // Digits that continue a variable name (A1, X12$) are plain ASCII.
+            if (inIdent && isDigit(c)) { L.body.push_back((uint8_t)c); i++; continue; }
+
+            // Keyword / operator match (longest first, case-insensitive).
             const Kw* best = nullptr;
             for (const auto& kw : keywordList()) {
                 size_t L2 = kw.text.size();
                 if (i + L2 > m) continue;
                 bool eq = true;
                 for (size_t k = 0; k < L2; ++k) {
-                    char a = ln[i + k], b = kw.text[k];
-                    if (toupper((unsigned char)a) != toupper((unsigned char)b)) { eq = false; break; }
+                    if (toupper((unsigned char)ln[i + k]) != (unsigned char)kw.text[k]) { eq = false; break; }
                 }
                 if (eq) { best = &kw; break; } // list is longest-first
             }
             if (best) {
-                if (best->ext) { L.body.push_back(0xFF); L.body.push_back(best->code); }
-                else L.body.push_back(best->code);
                 i += best->text.size();
-                if (best->code == 0x8F || best->code == 0xE6) { // REM / '
+                inIdent = false;
+                if (best->code == 0xE6 && !best->ext) {         // ' -> : REM '
+                    L.body.push_back(':'); L.body.push_back(0x8F); L.body.push_back(0xE6);
                     while (i < m) L.body.push_back((uint8_t)ln[i++]);
                     break;
                 }
-                lineRef = isJumpToken(best->code) || (lineRef && best->code == 0x8A);
+                if (best->code == 0xA1 && !best->ext) L.body.push_back(':'); // ELSE -> : ELSE
+                if (best->ext) { L.body.push_back(0xFF); L.body.push_back(best->code); }
+                else L.body.push_back(best->code);
+                if (!best->ext && best->code == 0x8F) {        // REM: rest is literal
+                    while (i < m) L.body.push_back((uint8_t)ln[i++]);
+                    break;
+                }
+                if (!best->ext && best->code == 0x84) {        // DATA: literal up to ':'
+                    bool q = false;
+                    while (i < m && (q || ln[i] != ':')) {
+                        if (ln[i] == '"') q = !q;
+                        L.body.push_back((uint8_t)ln[i++]);
+                    }
+                    lineRef = false;
+                    continue;
+                }
+                bool keepRange = lineRef && !best->ext && best->code == 0xF2; // LIST 10-20
+                lineRef = (!best->ext && isJumpToken(best->code)) || keepRange;
                 continue;
             }
-            // Number literal
-            if (isdigit((unsigned char)c) || (c == '&') ||
-                (c == '.' && i + 1 < m && isdigit((unsigned char)ln[i+1]))) {
-                if (c == '&' && i + 1 < m && (ln[i+1] == 'H' || ln[i+1] == 'h')) {
-                    i += 2; unsigned v = 0;
-                    while (i < m && isxdigit((unsigned char)ln[i])) {
-                        char d = ln[i++];
-                        v = v * 16 + (isdigit((unsigned char)d) ? d - '0'
-                              : (toupper((unsigned char)d) - 'A' + 10));
+            // &H hex / &O or &<octal> octal constants; &B binary stays ASCII.
+            if (c == '&' && i + 1 < m) {
+                char t = (char)toupper((unsigned char)ln[i+1]);
+                if (t == 'H' || t == 'O' || (ln[i+1] >= '0' && ln[i+1] <= '7')) {
+                    bool hex = t == 'H';
+                    i += (t == 'H' || t == 'O') ? 2 : 1;
+                    unsigned v = 0;
+                    while (i < m && (hex ? isxdigit((unsigned char)ln[i]) != 0 : (ln[i] >= '0' && ln[i] <= '7'))) {
+                        char dch = (char)toupper((unsigned char)ln[i++]);
+                        v = v * (hex ? 16 : 8) + (unsigned)(isDigit(dch) ? dch - '0' : dch - 'A' + 10);
                     }
-                    L.body.push_back(0x0C);
+                    L.body.push_back(hex ? 0x0C : 0x0B);
                     L.body.push_back(v & 0xFF); L.body.push_back((v >> 8) & 0xFF);
+                    inIdent = lineRef = false;
                     continue;
                 }
-                if (c == '&' && i + 1 < m && (ln[i+1] == 'O' || ln[i+1] == 'o')) {
-                    i += 2; unsigned v = 0;
-                    while (i < m && ln[i] >= '0' && ln[i] <= '7') v = v * 8 + (ln[i++] - '0');
-                    L.body.push_back(0x0B);
+            }
+            // Decimal number.
+            if (isDigit(c) || (c == '.' && i + 1 < m && isDigit(ln[i+1]))) {
+                ParsedNum pn;
+                size_t end = parseNumber(ln, i, pn);
+                if (lineRef && pn.integral && !pn.suffix && pn.approx <= 65535) {
+                    long v = atol(ln.substr(i, end - i).c_str());
+                    L.body.push_back(0x0E);
                     L.body.push_back(v & 0xFF); L.body.push_back((v >> 8) & 0xFF);
-                    continue;
-                }
-                // Decimal integer or float
-                size_t s = i; bool isFloat = false;
-                while (i < m && isdigit((unsigned char)ln[i])) i++;
-                if (i < m && ln[i] == '.') { isFloat = true; i++; while (i < m && isdigit((unsigned char)ln[i])) i++; }
-                if (i < m && (ln[i] == 'E' || ln[i] == 'e' || ln[i] == 'D' || ln[i] == 'd')) {
-                    isFloat = true; i++;
-                    if (i < m && (ln[i] == '+' || ln[i] == '-')) i++;
-                    while (i < m && isdigit((unsigned char)ln[i])) i++;
-                }
-                std::string num = ln.substr(s, i - s);
-                if (isFloat) {
-                    double v = atof(num.c_str());
-                    uint8_t b[8]; encodeBcdDouble(v, b);
-                    L.body.push_back(0x1F);
-                    for (int k = 0; k < 8; ++k) L.body.push_back(b[k]);
+                } else if (pn.suffix == '!' || (pn.expChar == 'E' && pn.suffix != '#')) {
+                    emitReal(L.body, pn.dec, false);
+                } else if (pn.suffix == '#' || pn.expChar == 'D' || !pn.integral || pn.approx > 32767) {
+                    emitReal(L.body, pn.dec, true);
                 } else {
-                    long v = atol(num.c_str());
-                    if (lineRef) {
-                        L.body.push_back(0x0E);
-                        L.body.push_back(v & 0xFF); L.body.push_back((v >> 8) & 0xFF);
-                    } else if (v >= 0 && v <= 9) {
-                        L.body.push_back((uint8_t)(0x11 + v));
-                    } else if (v >= 10 && v <= 255) {
-                        L.body.push_back(0x0F); L.body.push_back((uint8_t)v);
-                    } else if (v >= -32768 && v <= 32767) {
-                        L.body.push_back(0x1C);
-                        L.body.push_back(v & 0xFF); L.body.push_back((v >> 8) & 0xFF);
-                    } else {
-                        uint8_t b[8]; encodeBcdDouble((double)v, b);
-                        L.body.push_back(0x1F);
-                        for (int k = 0; k < 8; ++k) L.body.push_back(b[k]);
-                    }
+                    emitInt(L.body, atol(ln.substr(i, end - i).c_str()));
+                    if (pn.suffix == '%') L.body.push_back('%');
                 }
+                i = end;
+                inIdent = false;
                 continue;
             }
-            // Literal character. Keep line-ref mode only across spaces and
-            // commas (for ON..GOTO n,n,n lists); anything else ends it.
+            // Literal character. Letters start/continue a variable name and are
+            // stored in upper case, as the MSX-BASIC cruncher does.
+            if (isAlpha(c)) { inIdent = true; c = (char)toupper((unsigned char)c); }
+            else inIdent = false;
+            // Keep line-ref mode only across spaces and commas (ON..GOTO lists).
             if (c != ' ' && c != ',') lineRef = false;
             L.body.push_back((uint8_t)c);
             i++;
         }
-        lines.push_back(std::move(L));
+        // A later line with the same number replaces the earlier one; a bare
+        // line number deletes it (as typing it at the prompt would).
+        auto it = std::find_if(lines.begin(), lines.end(), [&](const Line& x) { return x.no == L.no; });
+        if (it != lines.end()) lines.erase(it);
+        if (!L.body.empty()) lines.push_back(std::move(L));
     }
+    std::stable_sort(lines.begin(), lines.end(), [](const Line& a, const Line& b) { return a.no < b.no; });
 
     // Emit with computed link addresses (base 0x8001).
     uint16_t addr = 0x8001;
