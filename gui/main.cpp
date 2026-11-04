@@ -1016,18 +1016,31 @@ static void drawManual(App& a) {
         auto P = [](const char* t){ ImGui::PushTextWrapPos(0); ImGui::TextUnformatted(t); ImGui::PopTextWrapPos(); };
 
         H("Opening media");
-        P("File > Open (Ctrl+O), drag a file onto the window, or paste a path in the top bar and press Open. "
-          "Supported: disk images .dsk / raw / .dmk, cartridge .rom (.mx1/.mx2), and .cas tapes.");
+        P("File > Open (Ctrl+O), drag a file onto the window, or paste a path in the top bar and press Open path. "
+          "Supported: floppy images .dsk / raw / .dmk, hard disk / SD card images (MSX-DOS 2 / Nextor, "
+          "FAT12 or FAT16, with or without a partition table), cartridge .rom (.mx1/.mx2), and .cas / "
+          ".tsx / .wav tapes. File > New blank disk creates an empty 720 KB or 360 KB floppy.");
 
         H("Browsing a disk");
-        P("The left panel lists the FAT12 filesystem. Directories are yellow and marked [D]; deleted "
+        P("The left panel lists the filesystem. Directories are yellow and marked [D]; deleted "
           "entries are red (enable 'Show deleted'). Click a directory to enter it, '.. (up)' to go back, "
-          "and a file to open it on the right.");
+          "and a file to open it on the right. On a partitioned hard disk image, the Partition selector "
+          "above the tree chooses which drive to show.");
+
+        H("Files and folders");
+        P("- Add file: copies a PC file into the current folder. Long or invalid names become valid 8.3 "
+          "names automatically (My Program.bas -> MYPROG~1.BAS).\n"
+          "- New folder / Rename: names you type must be valid 8.3 (up to 8 characters, optional dot and "
+          "up to 3 more, no spaces).\n"
+          "- Remove this folder: deletes the folder you are in; it must be empty.\n"
+          "- Undelete: select a deleted (red) file, type its lost first letter in the box and press "
+          "Undelete. Works when its clusters were contiguous and have not been reused (like MSX-DOS UNDEL).");
 
         H("Editing a file");
         P("- BASIC (edit): tokenized BASIC is shown as a normal listing you can edit. 'Save to image' "
           "re-tokenizes it and writes it back.\n"
           "- Text (edit): ASCII files are edited as plain text.\n"
+          "- BLOAD: start / end / exec addresses of BSAVE binaries.\n"
           "- Hex (edit): click any byte to type a new value, or use the offset/value 'Set byte' box. "
           "Changed bytes are highlighted yellow. 'Save to image' writes the bytes back.\n"
           "Growing or shrinking a file automatically re-allocates FAT clusters.");
@@ -1038,7 +1051,13 @@ static void drawManual(App& a) {
 
         H("Saving");
         P("Edits live in an in-memory copy of the image until you choose File > Save image (Ctrl+S) or "
-          "Save image as (Ctrl+Shift+S). The status bar shows when the image has unsaved changes.");
+          "Save image as (Ctrl+Shift+S). The status bar shows when the image has unsaved changes. "
+          "File > Keep .bak on save keeps a copy of the previous file.");
+
+        H("Checking a disk");
+        P("Tools > Check filesystem (fsck) reports cross-linked files, broken chains, sizes that do not "
+          "match their chain and lost clusters. Tools > Open in openMSX starts the emulator with the "
+          "disk (openMSX must be installed and on the PATH).");
 
         H("Protected / RAW disks");
         P("Some games (Fray, Xak, ...) show only 1-2 files in the tree but the disk is nearly full. The "
@@ -1056,6 +1075,11 @@ static void drawManual(App& a) {
         H("ROM / CAS");
         P("ROMs show size, page count, the AB header entry points and a detected mapper "
           "(Konami / SCC / ASCII8 / ASCII16). CAS files show their block layout and file names.");
+
+        H("More");
+        P("The full user manual (Spanish), with every CLI command, recipes and troubleshooting, is "
+          "docs/MANUAL.md in the source repository. The msxforge command-line tool does everything "
+          "this window does, for scripts and batches; run it without arguments for its command list.");
 
         H("Sources & references");
         struct Src { const char* label; const char* url; };

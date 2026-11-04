@@ -102,6 +102,11 @@ Linux, macOS arm64 and Windows):
 - **cli_smoke** (`tests/cli_smoke.cmake`): drives the `msxforge` binary end to
   end on a freshly formatted disk.
 
+## User manual
+
+A complete user manual (in Spanish) — GUI, every CLI command, hard disk / SD
+images, recipes and troubleshooting — is in [`docs/MANUAL.md`](docs/MANUAL.md).
+
 ## CLI usage
 
 Every `<FILE>` may be a path into subdirectories (`GAMES/SAVE/SLOT1.DAT`),
