@@ -77,6 +77,20 @@ public:
     // Remove an EMPTY subdirectory (only "." and ".." left) and free its chain.
     bool removeDir(const DirEntry& e, std::string* err = nullptr);
 
+    // Recover a deleted FILE (first name byte 0xE5). Like MSX-DOS UNDEL, this
+    // assumes the file's clusters were contiguous from its start cluster and
+    // requires every one of them to still be free; `firstChar` replaces the
+    // lost first letter. Updates `e`. Directories are not recoverable.
+    bool undelete(DirEntry& e, char firstChar, std::string* err = nullptr);
+
+    // Set the read-only / hidden / system / archive bits (0x01 0x02 0x04 0x20)
+    // of an entry; the directory and volume bits are kept. Updates `e`.
+    bool setAttributes(DirEntry& e, uint8_t attr, std::string* err = nullptr);
+
+    // Set (or, with an empty string, remove) the volume label: the root
+    // directory VOL entry, up to 11 characters, stored in upper case.
+    bool setVolumeLabel(const std::string& label, std::string* err = nullptr);
+
     // Find a file or directory by path ("/GAMES/SAVE/SLOT1.DAT", case-insensitive).
     // Returns false if any component is missing.
     bool lookup(const std::string& path, DirEntry& out) const;
@@ -84,6 +98,12 @@ public:
     // True if `name` is a legal MSX-DOS 8.3 name (1-8 char base, optional 1-3
     // char extension, no spaces or reserved characters). Case-insensitive.
     static bool validName83(const std::string& name, std::string* err = nullptr);
+
+    // Turn an arbitrary host file name into a valid 8.3 name that is not in
+    // `taken` (case-insensitive): upper case, spaces dropped, reserved
+    // characters -> '_', base cut to 8 and extension to 3, "~N" on clashes.
+    static std::string suggestName83(const std::string& hostName,
+                                     const std::vector<std::string>& taken);
 
     // Timestamp written into new/modified directory entries (FAT date/time
     // words). By default the current local time is used; a fixed stamp makes

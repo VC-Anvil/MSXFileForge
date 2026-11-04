@@ -95,6 +95,7 @@ struct App {
 
     // B1/B3 UI state
     bool openRename = false, openNewFolder = false;
+    char undelBuf[2] = {0};
     char nameBuf[16] = {0};
     bool backupOnSave = true;
     bool showFsck = false;
@@ -649,12 +650,16 @@ static void drawFileTree(App& a) {
         std::string p = openDialog("Add file to disk", {"*.*"}, "All files");
         if (!p.empty()) {
             auto data = slurp(p); std::string err;
-            if (a.fs.createFile(a.cwd, fileBaseName(p), data, &err)) {
-                a.status = "Added " + fileBaseName(p) + " (" + std::to_string(data.size()) + " B)"; refreshListing(a);
+            std::vector<std::string> taken;
+            for (auto& x : a.fs.list(a.cwd, false)) taken.push_back(x.name);
+            std::string name = Fat12::suggestName83(fileBaseName(p), taken);
+            if (a.fs.createFile(a.cwd, name, data, &err)) {
+                a.status = "Added " + fileBaseName(p) + " as " + name + " (" + std::to_string(data.size()) + " B)"; refreshListing(a);
             } else a.status = "Add failed: " + err;
         }
     }
-    help("Copy a file from your PC into the current directory as a new 8.3 entry (grows the FAT as needed).");
+    help("Copy a file from your PC into the current directory as a new 8.3 entry (grows the FAT as needed). "
+         "Long or invalid names are shortened, e.g. 'My Program.bas' -> MYPROG~1.BAS.");
     ImGui::SameLine();
     if (ImGui::Button("New folder")) { a.nameBuf[0] = 0; a.openNewFolder = true; }
     ImGui::SameLine();
@@ -768,6 +773,20 @@ static void drawFileToolbar(App& a) {
     }
     help("Replace this file's contents with a file from your PC (grows/shrinks the cluster chain automatically).");
     ImGui::SameLine();
+    if (e.deleted) {
+        ImGui::SetNextItemWidth(30);
+        ImGui::InputText("##first", a.undelBuf, 2);
+        ImGui::SameLine();
+        if (ImGui::Button("Undelete") ) {
+            DirEntry copy = e; std::string err;
+            char letter = a.undelBuf[0] ? a.undelBuf[0] : 'X';
+            if (a.fs.undelete(copy, letter, &err)) { a.status = "Recovered " + copy.name + " (image modified)"; refreshListing(a); }
+            else a.status = "Undelete failed: " + err;
+        }
+        help("Recover this deleted file. Type the lost first letter in the box. Works when its clusters "
+             "were contiguous and have not been reused since (like MSX-DOS UNDEL).");
+        return;
+    }
     if (ImGui::Button("Delete file")) {
         std::string err, name = a.selName;
         if (a.fs.deleteFile(e, &err)) { a.status = "Deleted " + name + " (image modified)"; refreshListing(a); }

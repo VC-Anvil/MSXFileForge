@@ -181,6 +181,8 @@ std::vector<DirEntry> Fat12::parseEntries(const std::vector<uint8_t>& buf,
         std::string ext  = trim(std::string((const char*)e + 8, 3));
         if (del && !base.empty()) base[0] = '?'; // first char was overwritten
         d.name = ext.empty() ? base : base + "." + ext;
+        if ((attr & 0x08) && !(attr & 0x10))     // volume label: 11 chars, no dot
+            d.name = trim(std::string((const char*)e, 11));
         d.attr = attr;
         d.time = rd16(e + 0x16);
         d.date = rd16(e + 0x18);
@@ -505,6 +507,101 @@ bool Fat12::removeDir(const DirEntry& e, std::string* err) {
     return true;
 }
 
+bool Fat12::undelete(DirEntry& e, char firstChar, std::string* err) {
+    if (!mounted_) { if (err) *err = "not mounted"; return false; }
+    if (!e.deleted || e.entryOffset < 0 || e.raw83.size() != 11) {
+        if (err) *err = "entry is not a deleted file";
+        return false;
+    }
+    if (e.isDir() || e.isVolume()) {
+        if (err) *err = "only files can be recovered (directory chains are not recorded)";
+        return false;
+    }
+    std::string candidate = e.name;
+    if (candidate.empty()) { if (err) *err = "entry has no name"; return false; }
+    candidate[0] = (char)toupper((unsigned char)firstChar);
+    if (!validName83(candidate, err)) return false;
+    uint8_t nm[11];
+    memcpy(nm, e.raw83.data(), 11);
+    nm[0] = (uint8_t)toupper((unsigned char)firstChar);
+
+    // Which directory holds the entry? (Needed for the name collision check.)
+    int dirOf = -1;
+    std::set<int> seen;
+    std::vector<int> todo{0};
+    while (!todo.empty() && dirOf < 0) {
+        int dc = todo.back(); todo.pop_back();
+        if (!seen.insert(dc).second) continue;
+        for (auto& x : readDir(dc, true)) {
+            if (x.entryOffset == e.entryOffset) { dirOf = dc; break; }
+            if (!x.deleted && x.isDir() && x.startCluster >= 2 && x.name != "." && x.name != "..")
+                todo.push_back(x.startCluster);
+        }
+    }
+    if (dirOf < 0) { if (err) *err = "entry not found in the directory tree"; return false; }
+    if (nameTaken(dirOf, nm)) { if (err) *err = "a live file already has that name"; return false; }
+
+    long clusterBytes = (long)spc_ * 512;
+    long need = ((long)e.size + clusterBytes - 1) / clusterBytes;
+    if (need > 0) {
+        if (e.startCluster < 2 || e.startCluster - 2 + need > totalClusters_) {
+            if (err) *err = "start cluster / size out of range";
+            return false;
+        }
+        for (long i = 0; i < need; ++i) {
+            if (fatEntry(e.startCluster + (int)i) != 0) {
+                if (err) *err = "cluster " + std::to_string(e.startCluster + i) +
+                                " has been reused; the data cannot be recovered intact";
+                return false;
+            }
+        }
+        for (long i = 0; i < need; ++i) {
+            int c = e.startCluster + (int)i;
+            setFatEntry(c, i + 1 < need ? c + 1 : 0xFFF);
+        }
+    }
+    writeByteAt(e.entryOffset, nm[0]);
+    e.raw83.assign((const char*)nm, 11);
+    e.name = candidate;
+    e.deleted = false;
+    return true;
+}
+
+bool Fat12::setAttributes(DirEntry& e, uint8_t attr, std::string* err) {
+    if (!mounted_ || e.entryOffset < 0 || e.deleted) { if (err) *err = "not a live entry"; return false; }
+    if (!e.raw83.empty() && e.raw83[0] == '.') { if (err) *err = "cannot change . or .."; return false; }
+    uint8_t v = (uint8_t)((e.attr & 0x18) | (attr & 0x27));
+    if (!writeByteAt(e.entryOffset + 0x0B, v)) { if (err) *err = "write error"; return false; }
+    e.attr = v;
+    return true;
+}
+
+bool Fat12::setVolumeLabel(const std::string& label, std::string* err) {
+    if (!mounted_) { if (err) *err = "not mounted"; return false; }
+    if (label.size() > 11) { if (err) *err = "a volume label has at most 11 characters"; return false; }
+    for (char ch : label) {
+        unsigned char c = (unsigned char)ch;
+        if (c < 0x20 || c == 0x7F || strchr("\"*+,./:;<=>?[\\]|", c)) {
+            if (err) *err = "reserved character in the label";
+            return false;
+        }
+    }
+    long existing = -1;
+    for (auto& e : readRootDir(false)) if (e.isVolume()) { existing = e.entryOffset; break; }
+    if (label.empty()) {
+        if (existing >= 0) writeByteAt(existing, 0xE5);
+        volLabel_.clear();
+        return true;
+    }
+    uint8_t nm[11]; memset(nm, ' ', 11);
+    for (size_t i = 0; i < label.size(); ++i) nm[i] = (uint8_t)toupper((unsigned char)label[i]);
+    long slot = existing >= 0 ? existing : freeDirSlot(0, false);
+    if (slot < 0) { if (err) *err = "root directory is full"; return false; }
+    writeDirEntry(slot, nm, 0x08, 0, 0);
+    volLabel_ = trim(std::string((const char*)nm, 11));
+    return true;
+}
+
 // ---- RAW / uncatalogued data ----------------------------------------------
 
 long Fat12::clusterByteOffset(int cluster) const {
@@ -610,6 +707,43 @@ bool Fat12::validName83(const std::string& name, std::string* err) {
     }
     if ((unsigned char)base[0] == 0xE5) return bad("first character 0xE5 marks deleted entries");
     return true;
+}
+
+std::string Fat12::suggestName83(const std::string& hostName,
+                                 const std::vector<std::string>& taken) {
+    auto clean = [](const std::string& in, size_t maxLen) {
+        std::string out;
+        for (char ch : in) {
+            unsigned char c = (unsigned char)ch;
+            if (c == ' ' || c == '.') continue;
+            if (c < 0x20 || c == 0x7F || strchr("\"*+,/:;<=>?[\\]|", c)) c = '_';
+            out += (char)toupper(c);
+        }
+        if (!out.empty() && (unsigned char)out[0] == 0xE5) out[0] = '_';
+        if (out.size() > maxLen) out.resize(maxLen);
+        return out;
+    };
+    size_t dot = hostName.find_last_of('.');
+    bool hasExt = dot != std::string::npos && dot > 0 && dot + 1 < hostName.size();
+    std::string base = clean(hasExt ? hostName.substr(0, dot) : hostName, 64);
+    std::string ext  = clean(hasExt ? hostName.substr(dot + 1) : "", 3);
+    if (base.empty()) base = "FILE";
+    auto isTaken = [&](const std::string& n) {
+        for (auto t : taken) {
+            for (auto& c : t) c = (char)toupper((unsigned char)c);
+            if (t == n) return true;
+        }
+        return false;
+    };
+    auto join = [&](const std::string& b) { return ext.empty() ? b : b + "." + ext; };
+    std::string first = join(base.substr(0, 8));
+    if (base.size() <= 8 && !isTaken(first)) return first;
+    for (int n = 1; n < 100000; ++n) {
+        std::string tail = "~" + std::to_string(n);
+        std::string cand = join(base.substr(0, 8 - tail.size()) + tail);
+        if (!isTaken(cand)) return cand;
+    }
+    return first;
 }
 
 void Fat12::pack83(const std::string& name, uint8_t out[11]) {

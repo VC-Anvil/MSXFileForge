@@ -486,3 +486,122 @@ TEST(fat12_full_directory_growth_is_accounted) {
     CHECK_EQ(d.fs.freeBytes(), 0L);
     CHECK(clean(d.fs));
 }
+
+// ---- Undelete, attributes, volume label ------------------------------------
+
+TEST(fat12_undelete_restores_file) {
+    Disk d;
+    std::string err;
+    auto data = pattern(5000, 3);
+    CHECK(d.fs.createFile("/", "GAME.BIN", data, &err));
+    CHECK(d.fs.createFile("/", "KEEP.BIN", pattern(100, 4), &err));
+    DirEntry e; CHECK(d.find("/GAME.BIN", e));
+    CHECK(d.fs.deleteFile(e, &err));
+    DirEntry gone;
+    for (auto& x : d.fs.list("/", true)) if (x.deleted) gone = x;
+    CHECK_EQ(gone.name, std::string("?AME.BIN"));
+    CHECK(!d.fs.undelete(gone, '*', &err));        // illegal first character
+    CHECK(d.fs.undelete(gone, 'g', &err));
+    CHECK_EQ(gone.name, std::string("GAME.BIN"));
+    d.remount();
+    CHECK(d.find("/GAME.BIN", e));
+    CHECK(d.fs.readFile(e) == data);
+    CHECK(clean(d.fs));
+    CHECK_EQ(d.fs.freeBytes(), (713L - 5 - 1) * 1024);
+}
+
+TEST(fat12_undelete_refuses_reused_clusters_and_collisions) {
+    Disk d;
+    std::string err;
+    CHECK(d.fs.createFile("/", "OLD.BIN", pattern(3000, 1), &err));  // clusters 2-4
+    CHECK(d.fs.createFile("/", "KEEP.BIN", pattern(100, 2), &err));  // cluster 5
+    DirEntry e; CHECK(d.find("/OLD.BIN", e));
+    CHECK(d.fs.deleteFile(e, &err));
+    DirEntry k; CHECK(d.find("/KEEP.BIN", k));
+    CHECK(d.fs.writeFile(k, pattern(2000, 3), &err));                 // grows into cluster 2
+    DirEntry gone;
+    for (auto& x : d.fs.list("/", true)) if (x.deleted) gone = x;
+    CHECK(gone.deleted);
+    CHECK(!d.fs.undelete(gone, 'O', &err));
+    CHECK(err.find("reused") != std::string::npos);
+    // Name collision: a live file took the deleted file's name meanwhile.
+    CHECK(d.fs.createFile("/", "TWIN.TXT", {}, &err));
+    CHECK(d.fs.createFile("/", "OTHER.TXT", {}, &err));
+    DirEntry t; CHECK(d.find("/TWIN.TXT", t)); CHECK(d.fs.deleteFile(t, &err));
+    DirEntry o; CHECK(d.find("/OTHER.TXT", o)); CHECK(d.fs.renameEntry(o, "TWIN.TXT", &err));
+    DirEntry gt;
+    for (auto& x : d.fs.list("/", true)) if (x.deleted && x.name == "?WIN.TXT") gt = x;
+    CHECK(gt.deleted);
+    CHECK(!d.fs.undelete(gt, 'T', &err));
+    CHECK(err.find("already") != std::string::npos);
+    CHECK(clean(d.fs));
+}
+
+TEST(fat12_undelete_in_subdirectory) {
+    Disk d;
+    std::string err;
+    CHECK(d.fs.makeDir("/", "SAVE", &err));
+    CHECK(d.fs.createFile("/SAVE", "SLOT.DAT", pattern(1500, 9), &err));
+    DirEntry e; CHECK(d.find("/SAVE/SLOT.DAT", e));
+    CHECK(d.fs.deleteFile(e, &err));
+    DirEntry gone;
+    for (auto& x : d.fs.list("/SAVE", true)) if (x.deleted) gone = x;
+    CHECK(d.fs.undelete(gone, 'S', &err));
+    CHECK(d.find("/SAVE/SLOT.DAT", e));
+    CHECK(d.fs.readFile(e) == pattern(1500, 9));
+    CHECK(clean(d.fs));
+}
+
+TEST(fat12_set_attributes) {
+    Disk d;
+    std::string err;
+    CHECK(d.fs.createFile("/", "A.BIN", pattern(10, 1), &err));
+    CHECK(d.fs.makeDir("/", "DIR", &err));
+    DirEntry e; CHECK(d.find("/A.BIN", e));
+    CHECK(d.fs.setAttributes(e, 0x01 | 0x02 | 0x10 /* dir bit ignored */, &err));
+    d.remount();
+    CHECK(d.find("/A.BIN", e));
+    CHECK_EQ(e.attr, (uint8_t)0x03);
+    DirEntry dir; CHECK(d.find("/DIR", dir));
+    CHECK(d.fs.setAttributes(dir, 0x02, &err));
+    CHECK(d.find("/DIR", dir));
+    CHECK_EQ(dir.attr, (uint8_t)0x12);       // still a directory
+    CHECK(clean(d.fs));
+}
+
+TEST(fat12_volume_label) {
+    Disk d;
+    std::string err;
+    CHECK(d.fs.volumeLabel().empty());
+    CHECK(d.fs.setVolumeLabel("my disk 123", &err));
+    CHECK_EQ(d.fs.volumeLabel(), std::string("MY DISK 123"));
+    d.remount();
+    CHECK_EQ(d.fs.volumeLabel(), std::string("MY DISK 123"));
+    CHECK(d.fs.setVolumeLabel("GAMES", &err));   // replaces, no second entry
+    int vols = 0;
+    for (auto& e : d.fs.list("/")) if (e.isVolume()) vols++;
+    CHECK_EQ(vols, 1);
+    CHECK(!d.fs.setVolumeLabel("TWELVE CHARS", &err));
+    CHECK(!d.fs.setVolumeLabel("A*B", &err));
+    CHECK(d.fs.setVolumeLabel("", &err));
+    d.remount();
+    CHECK(d.fs.volumeLabel().empty());
+    CHECK(clean(d.fs));
+}
+
+TEST(fat12_suggest_name83) {
+    std::vector<std::string> none;
+    CHECK_EQ(Fat12::suggestName83("game.bin", none), std::string("GAME.BIN"));
+    CHECK_EQ(Fat12::suggestName83("My Long Program.bas", none), std::string("MYLONG~1.BAS"));
+    CHECK_EQ(Fat12::suggestName83("archive.tar.gz", none), std::string("ARCHIV~1.GZ"));
+    CHECK_EQ(Fat12::suggestName83("readme", none), std::string("README"));
+    CHECK_EQ(Fat12::suggestName83("a+b=c.text", none), std::string("A_B_C.TEX"));
+    CHECK_EQ(Fat12::suggestName83(".hidden", none), std::string("HIDDEN"));
+    CHECK_EQ(Fat12::suggestName83("...", none), std::string("FILE"));
+    std::vector<std::string> taken{"GAME.BIN", "mylong~1.bas"};
+    CHECK_EQ(Fat12::suggestName83("game.bin", taken), std::string("GAME~1.BIN"));
+    CHECK_EQ(Fat12::suggestName83("my long program.bas", taken), std::string("MYLONG~2.BAS"));
+    std::string err;
+    for (const char* h : {"x y z.q", "über.dat", "12345678901234567890", "-.-"})
+        CHECK(Fat12::validName83(Fat12::suggestName83(h, none), &err));
+}
