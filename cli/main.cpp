@@ -13,6 +13,7 @@
 #include "../core/cas.h"
 #include "../core/util.h"
 #include "../core/tape.h"
+#include "hostfs.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -286,7 +287,13 @@ static int cmd_add(int argc, char** argv) {
     if (argc < 4) { fprintf(stderr, "need <image> <hostfile> [/DIR] [NAME]\n"); return 1; }
     DiskImage dk; Fat12 fs; int rc = mountDisk(argv[2], dk, fs); if (rc) return rc;
     std::string dir = (argc >= 5) ? argv[4] : "/";
-    std::string name = (argc >= 6) ? argv[5] : baseName(argv[3]);
+    std::string name;
+    if (argc >= 6) name = argv[5];
+    else {   // derive a valid 8.3 name from the host file name
+        std::vector<std::string> taken;
+        for (auto& x : fs.list(dir, false)) taken.push_back(x.name);
+        name = Fat12::suggestName83(baseName(argv[3]), taken);
+    }
     auto data = slurp(argv[3]);
     std::string err;
     if (!fs.createFile(dir, name, data, &err)) { fprintf(stderr, "add: %s\n", err.c_str()); return 6; }
@@ -315,6 +322,160 @@ static int cmd_mkdir(int argc, char** argv) {
     if (!fs.makeDir(parent, argv[3], &err)) { fprintf(stderr, "mkdir: %s\n", err.c_str()); return 6; }
     if (!dk.save(argv[2], &err)) { fprintf(stderr, "save: %s\n", err.c_str()); return 7; }
     printf("created dir %s in %s\n", argv[3], parent.c_str()); return 0;
+}
+
+static std::string upper(std::string s) {
+    for (auto& c : s) c = (char)toupper((unsigned char)c);
+    return s;
+}
+
+static int cmd_undelete(int argc, char** argv) {
+    // undelete <image> <[DIR/]NAME> [LETTER] [outimage]
+    if (argc < 4) { fprintf(stderr, "need <image> <[DIR/]NAME> [LETTER] [outimage]\n"); return 1; }
+    DiskImage dk; Fat12 fs; int rc = mountDisk(argv[2], dk, fs); if (rc) return rc;
+    std::string path = argv[3];
+    size_t cut = path.find_last_of("/\\");
+    std::string dir = cut == std::string::npos ? "/" : path.substr(0, cut);
+    if (dir.empty()) dir = "/";
+    std::string leaf = upper(cut == std::string::npos ? path : path.substr(cut + 1));
+    if (leaf.size() < 2) { fprintf(stderr, "name too short\n"); return 1; }
+    int argi = 4;
+    char letter = leaf[0];
+    if (letter == '?') {
+        if (argc <= argi || strlen(argv[argi]) != 1) {
+            fprintf(stderr, "the first letter is lost: give it, e.g. `undelete img ?AME.BIN G`\n"); return 1;
+        }
+        letter = argv[argi++][0];
+    } else if (argc > argi && strlen(argv[argi]) == 1) {
+        letter = argv[argi++][0];
+    }
+    const char* out = argc > argi ? argv[argi] : argv[2];
+    std::vector<DirEntry> hits;
+    for (auto& e : fs.list(dir, true))
+        if (e.deleted && upper(e.name).substr(1) == leaf.substr(1)) hits.push_back(e);
+    if (hits.empty()) { fprintf(stderr, "no deleted entry matches %s in %s\n", leaf.c_str(), dir.c_str()); return 4; }
+    std::string err;
+    for (auto& e : hits) {   // several deletions of the same name: newest-recoverable first
+        if (fs.undelete(e, letter, &err)) {
+            if (!dk.save(out, &err)) { fprintf(stderr, "save: %s\n", err.c_str()); return 7; }
+            printf("recovered %s (%u bytes) -> %s\n", e.name.c_str(), e.size, out);
+            return 0;
+        }
+    }
+    fprintf(stderr, "undelete: %s\n", err.c_str());
+    return 6;
+}
+
+static int cmd_attrib(int argc, char** argv) {
+    // attrib <image> <FILE> [+R -R +H -H +S -S +A -A ...]
+    if (argc < 4) { fprintf(stderr, "need <image> <FILE> [+R|-R|+H|-H|+S|-S|+A|-A ...]\n"); return 1; }
+    DiskImage dk; Fat12 fs; int rc = mountDisk(argv[2], dk, fs); if (rc) return rc;
+    DirEntry e;
+    if (!findEntry(fs, argv[3], e)) { fprintf(stderr, "not found: %s\n", argv[3]); return 4; }
+    if (argc == 4) { printf("%s  %s\n", e.attrString().c_str(), e.name.c_str()); return 0; }
+    uint8_t a = e.attr;
+    for (int i = 4; i < argc; ++i) {
+        std::string f = upper(argv[i]);
+        uint8_t bit = 0;
+        if (f.size() == 2) bit = f[1] == 'R' ? 0x01 : f[1] == 'H' ? 0x02 : f[1] == 'S' ? 0x04 : f[1] == 'A' ? 0x20 : 0;
+        if (!bit || (f[0] != '+' && f[0] != '-')) { fprintf(stderr, "bad flag %s\n", argv[i]); return 1; }
+        a = f[0] == '+' ? (uint8_t)(a | bit) : (uint8_t)(a & ~bit);
+    }
+    std::string err;
+    if (!fs.setAttributes(e, a, &err)) { fprintf(stderr, "attrib: %s\n", err.c_str()); return 6; }
+    if (!dk.save(argv[2], &err)) { fprintf(stderr, "save: %s\n", err.c_str()); return 7; }
+    printf("%s  %s\n", e.attrString().c_str(), e.name.c_str());
+    return 0;
+}
+
+static int cmd_label(int argc, char** argv) {
+    // label <image> [LABEL | --clear]
+    DiskImage dk; Fat12 fs; int rc = mountDisk(argv[2], dk, fs); if (rc) return rc;
+    if (argc < 4) { printf("%s\n", fs.volumeLabel().empty() ? "(no label)" : fs.volumeLabel().c_str()); return 0; }
+    std::string want = strcmp(argv[3], "--clear") == 0 ? "" : argv[3];
+    std::string err;
+    if (!fs.setVolumeLabel(want, &err)) { fprintf(stderr, "label: %s\n", err.c_str()); return 6; }
+    if (!dk.save(argv[2], &err)) { fprintf(stderr, "save: %s\n", err.c_str()); return 7; }
+    printf("label: %s\n", fs.volumeLabel().empty() ? "(removed)" : fs.volumeLabel().c_str());
+    return 0;
+}
+
+static bool writeHost(const std::string& path, const std::vector<uint8_t>& d) {
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) return false;
+    bool ok = fwrite(d.data(), 1, d.size(), f) == d.size();
+    return fclose(f) == 0 && ok;
+}
+
+static int unpackDir(const Fat12& fs, const std::string& dir, const std::string& host,
+                     std::vector<int>& seen, int& files) {
+    if (!hostfs::makeDir(host)) { fprintf(stderr, "cannot create %s\n", host.c_str()); return 5; }
+    for (auto& e : fs.list(dir, false)) {
+        if (e.isVolume() || e.name == "." || e.name == "..") continue;
+        std::string sub = (dir == "/" ? "" : dir) + "/" + e.name;
+        std::string target = hostfs::join(host, e.name);
+        if (e.isDir()) {
+            if (std::find(seen.begin(), seen.end(), (int)e.startCluster) != seen.end()) continue;
+            seen.push_back((int)e.startCluster);
+            if (int rc = unpackDir(fs, sub, target, seen, files)) return rc;
+        } else {
+            if (!writeHost(target, fs.readFile(e))) { fprintf(stderr, "cannot write %s\n", target.c_str()); return 5; }
+            files++;
+        }
+    }
+    return 0;
+}
+
+static int cmd_unpack(int argc, char** argv) {
+    // unpack <image> <hostdir>
+    if (argc < 4) { fprintf(stderr, "need <image> <hostdir>\n"); return 1; }
+    DiskImage dk; Fat12 fs; int rc = mountDisk(argv[2], dk, fs); if (rc) return rc;
+    std::vector<int> seen; int files = 0;
+    if ((rc = unpackDir(fs, "/", argv[3], seen, files))) return rc;
+    printf("extracted %d file(s) to %s\n", files, argv[3]);
+    return 0;
+}
+
+static int packDir(Fat12& fs, const std::string& host, const std::string& dir, int& files) {
+    std::vector<std::string> taken;
+    for (auto& e : fs.list(dir, false)) taken.push_back(e.name);
+    for (auto& h : hostfs::list(host)) {
+        std::string name = Fat12::suggestName83(h.name, taken);
+        taken.push_back(name);
+        if (upper(h.name) != name) printf("  %s -> %s\n", hostfs::join(host, h.name).c_str(), name.c_str());
+        std::string err, sub = (dir == "/" ? "" : dir) + "/" + name;
+        if (h.isDir) {
+            if (!fs.makeDir(dir, name, &err)) { fprintf(stderr, "mkdir %s: %s\n", sub.c_str(), err.c_str()); return 6; }
+            if (int rc = packDir(fs, hostfs::join(host, h.name), sub, files)) return rc;
+        } else {
+            auto data = slurp(hostfs::join(host, h.name).c_str());
+            if (!fs.createFile(dir, name, data, &err)) { fprintf(stderr, "add %s: %s\n", sub.c_str(), err.c_str()); return 6; }
+            files++;
+        }
+    }
+    return 0;
+}
+
+static int cmd_pack(int argc, char** argv) {
+    // pack <hostdir> <out.dsk> [360|720] [--label NAME]
+    if (argc < 4) { fprintf(stderr, "need <hostdir> <out.dsk> [360|720] [--label NAME]\n"); return 1; }
+    if (!hostfs::isDir(argv[2])) { fprintf(stderr, "not a directory: %s\n", argv[2]); return 2; }
+    int kb = 720; std::string label;
+    for (int i = 4; i < argc; ++i) {
+        if (!strcmp(argv[i], "--label") && i + 1 < argc) label = argv[++i];
+        else if (!strcmp(argv[i], "360")) kb = 360;
+        else if (!strcmp(argv[i], "720")) kb = 720;
+        else { fprintf(stderr, "unknown option %s\n", argv[i]); return 1; }
+    }
+    DiskImage dk; Fat12 fs; std::string err;
+    dk.loadBytes(formatBlankImage(kb == 360 ? 720 : 1440), argv[3], &err);
+    if (!fs.mount(dk, &err)) { fprintf(stderr, "format: %s\n", err.c_str()); return 3; }
+    if (!label.empty() && !fs.setVolumeLabel(label, &err)) { fprintf(stderr, "label: %s\n", err.c_str()); return 6; }
+    int files = 0;
+    if (int rc = packDir(fs, argv[2], "/", files)) return rc;
+    if (!dk.save(argv[3], &err)) { fprintf(stderr, "save: %s\n", err.c_str()); return 7; }
+    printf("packed %d file(s) into %dKB image %s (%ld bytes free)\n", files, kb, argv[3], fs.freeBytes());
+    return 0;
 }
 
 static int cmd_crc(int argc, char** argv) {
@@ -450,6 +611,11 @@ int main(int argc, char** argv) {
             "  rename  <img> <FILE> <NEWNAME>      rename in place\n"
             "  mkdir   <img> <NAME> [/PARENT]      create a directory\n"
             "  format  <out.dsk> [360|720]         blank MSX-DOS disk\n"
+            "  pack    <hostdir> <out.dsk> [360|720] [--label L]  build a disk from a folder\n"
+            "  unpack  <img> <hostdir>             extract the whole tree to a folder\n"
+            "  undelete <img> <[DIR/]?NAME> [LETTER] [outimg]  recover a deleted file\n"
+            "  attrib  <img> <FILE> [+R -R +H -H +S -S +A -A]  show / set attributes\n"
+            "  label   <img> [LABEL|--clear]       show / set the volume label\n"
             "  fsck    <img>                       FAT integrity check\n"
             "  diff    <imgA> <imgB>               compare all files by CRC\n"
             "  crc     <img|file> [FILE]           CRC32 of an image or a file in it\n"
@@ -484,6 +650,11 @@ int main(int argc, char** argv) {
     if (cmd == "rename")  return cmd_rename(argc, argv);
     if (cmd == "mkdir")   return cmd_mkdir(argc, argv);
     if (cmd == "crc")     return cmd_crc(argc, argv);
+    if (cmd == "undelete") return cmd_undelete(argc, argv);
+    if (cmd == "attrib")  return cmd_attrib(argc, argv);
+    if (cmd == "label")   return cmd_label(argc, argv);
+    if (cmd == "pack")    return cmd_pack(argc, argv);
+    if (cmd == "unpack")  return cmd_unpack(argc, argv);
     if (cmd == "fsck")    return cmd_fsck(argv[2]);
     if (cmd == "diff")    return cmd_diff(argc, argv);
     if (cmd == "cas2wav" || cmd == "cas2tsx" || cmd == "tsx2cas" || cmd == "wav2cas")

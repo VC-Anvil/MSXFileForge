@@ -99,6 +99,12 @@ public:
     // char extension, no spaces or reserved characters). Case-insensitive.
     static bool validName83(const std::string& name, std::string* err = nullptr);
 
+    // Turn an arbitrary host file name into a valid 8.3 name that is not in
+    // `taken` (case-insensitive): upper case, spaces dropped, reserved
+    // characters -> '_', base cut to 8 and extension to 3, "~N" on clashes.
+    static std::string suggestName83(const std::string& hostName,
+                                     const std::vector<std::string>& taken);
+
     // Timestamp written into new/modified directory entries (FAT date/time
     // words). By default the current local time is used; a fixed stamp makes
     // output reproducible (tests, deterministic builds).

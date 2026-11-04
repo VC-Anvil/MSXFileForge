@@ -709,6 +709,43 @@ bool Fat12::validName83(const std::string& name, std::string* err) {
     return true;
 }
 
+std::string Fat12::suggestName83(const std::string& hostName,
+                                 const std::vector<std::string>& taken) {
+    auto clean = [](const std::string& in, size_t maxLen) {
+        std::string out;
+        for (char ch : in) {
+            unsigned char c = (unsigned char)ch;
+            if (c == ' ' || c == '.') continue;
+            if (c < 0x20 || c == 0x7F || strchr("\"*+,/:;<=>?[\\]|", c)) c = '_';
+            out += (char)toupper(c);
+        }
+        if (!out.empty() && (unsigned char)out[0] == 0xE5) out[0] = '_';
+        if (out.size() > maxLen) out.resize(maxLen);
+        return out;
+    };
+    size_t dot = hostName.find_last_of('.');
+    bool hasExt = dot != std::string::npos && dot > 0 && dot + 1 < hostName.size();
+    std::string base = clean(hasExt ? hostName.substr(0, dot) : hostName, 64);
+    std::string ext  = clean(hasExt ? hostName.substr(dot + 1) : "", 3);
+    if (base.empty()) base = "FILE";
+    auto isTaken = [&](const std::string& n) {
+        for (auto t : taken) {
+            for (auto& c : t) c = (char)toupper((unsigned char)c);
+            if (t == n) return true;
+        }
+        return false;
+    };
+    auto join = [&](const std::string& b) { return ext.empty() ? b : b + "." + ext; };
+    std::string first = join(base.substr(0, 8));
+    if (base.size() <= 8 && !isTaken(first)) return first;
+    for (int n = 1; n < 100000; ++n) {
+        std::string tail = "~" + std::to_string(n);
+        std::string cand = join(base.substr(0, 8 - tail.size()) + tail);
+        if (!isTaken(cand)) return cand;
+    }
+    return first;
+}
+
 void Fat12::pack83(const std::string& name, uint8_t out[11]) {
     memset(out, ' ', 11);
     if (name == ".") { out[0] = '.'; return; }

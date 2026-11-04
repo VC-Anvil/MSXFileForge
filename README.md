@@ -120,7 +120,12 @@ msxforge raw     <image> [out.bin]    cluster map (named/RAW/free) + extract RAW
 msxforge carve   <image>              split the RAW region into BLOAD/BASIC/gap blocks
 msxforge rawput  <image> <hostfile> [outimage]   write RAW data back into the image
 msxforge format  <out.dsk> [360|720]  create a blank formatted disk
-msxforge add     <image> <hostfile> [/DIR] [NAME]   add a new file
+msxforge pack    <hostdir> <out.dsk> [360|720] [--label L]  build a disk from a folder tree
+msxforge unpack  <image> <hostdir>    extract the whole tree to a folder
+msxforge undelete <image> <[DIR/]?NAME> [LETTER] [outimage]  recover a deleted file
+msxforge attrib  <image> <FILE> [+R -R +H -H +S -S +A -A]   show / set attributes
+msxforge label   <image> [LABEL|--clear]   show / set the volume label
+msxforge add     <image> <hostfile> [/DIR] [NAME]   add a new file (long names -> MYPROG~1.BAS)
 msxforge rename  <image> <OLD> <NEW>
 msxforge mkdir   <image> <NAME> [/PARENT]
 msxforge crc     <image> [FILE]       CRC32 of a file or the whole image
@@ -143,7 +148,8 @@ Drag a `.dsk` / `.dmk` / `.rom` / `.cas` onto the window, use **File > Open**
 - **Edit** a file three ways: as a **BASIC listing** (re-tokenized on save), as
   **text**, or as **hex** (click a byte or use the offset/value poke box;
   changed bytes highlight yellow).
-- **Import & replace**, **Export to file**, or **Delete** a file.
+- **Import & replace**, **Export to file**, or **Delete** a file; **Undelete** a
+  deleted one (type its lost first letter); **Add file** shortens long names to 8.3.
 - **Save image** / **Save image as** (Ctrl+S / Ctrl+Shift+S) to persist.
 - Inspect the physical sector table of protected images.
 - Built-in **Manual** (Help > Manual / F1) and `(?)` tooltips throughout.

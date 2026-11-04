@@ -588,3 +588,20 @@ TEST(fat12_volume_label) {
     CHECK(d.fs.volumeLabel().empty());
     CHECK(clean(d.fs));
 }
+
+TEST(fat12_suggest_name83) {
+    std::vector<std::string> none;
+    CHECK_EQ(Fat12::suggestName83("game.bin", none), std::string("GAME.BIN"));
+    CHECK_EQ(Fat12::suggestName83("My Long Program.bas", none), std::string("MYLONG~1.BAS"));
+    CHECK_EQ(Fat12::suggestName83("archive.tar.gz", none), std::string("ARCHIV~1.GZ"));
+    CHECK_EQ(Fat12::suggestName83("readme", none), std::string("README"));
+    CHECK_EQ(Fat12::suggestName83("a+b=c.text", none), std::string("A_B_C.TEX"));
+    CHECK_EQ(Fat12::suggestName83(".hidden", none), std::string("HIDDEN"));
+    CHECK_EQ(Fat12::suggestName83("...", none), std::string("FILE"));
+    std::vector<std::string> taken{"GAME.BIN", "mylong~1.bas"};
+    CHECK_EQ(Fat12::suggestName83("game.bin", taken), std::string("GAME~1.BIN"));
+    CHECK_EQ(Fat12::suggestName83("my long program.bas", taken), std::string("MYLONG~2.BAS"));
+    std::string err;
+    for (const char* h : {"x y z.q", "über.dat", "12345678901234567890", "-.-"})
+        CHECK(Fat12::validName83(Fat12::suggestName83(h, none), &err));
+}
