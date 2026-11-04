@@ -23,30 +23,40 @@ static uint16_t rd16(const std::vector<uint8_t>& d, size_t o) {
 
 // openMSX-style write-target tally: scan for `LD (nnnn),A` (0x32 lo hi) aimed
 // at each mapper's bank registers and pick the strongest match.
+//   Konami      : 0x6000 0x8000 0xA000 (0x4000-0x5FFF is fixed)
+//   Konami SCC  : 0x5000 0x7000 0x9000 0xB000
+//   ASCII8      : 0x6000 0x6800 0x7000 0x7800
+//   ASCII16     : 0x6000 0x7000 (often written as 0x77FF)
 static RomMapper guessMapper(const std::vector<uint8_t>& d) {
-    if (d.size() <= 0x8000 &&
-        ((d.size() >= 2 && d[0] == 'A' && d[1] == 'B') ||
-         (d.size() > 0x4000 && d[0x4000] == 'A' && d[0x4001] == 'B'))) {
-        // <=32K with a ROM header and no need to bank -> plain.
-        if (d.size() <= 0x8000) return RomMapper::None;
-    }
+    bool header = (d.size() >= 2 && d[0] == 'A' && d[1] == 'B') ||
+                  (d.size() > 0x4001 && d[0x4000] == 'A' && d[0x4001] == 'B');
+    // <=32K with a ROM header fits in the slot unbanked -> plain.
+    if (header && d.size() <= 0x8000) return RomMapper::None;
     int konami = 0, scc = 0, ascii8 = 0, ascii16 = 0;
     for (size_t i = 0; i + 2 < d.size(); ++i) {
         if (d[i] != 0x32) continue;               // LD (nnnn),A
         uint16_t a = d[i+1] | (d[i+2] << 8);
         // Addresses are shared across mapper families, so tally independently.
-        if (a == 0x6000) { konami++; ascii8++; ascii16++; }
-        if (a == 0x8000 || a == 0xA000) konami++;
-        if (a == 0x5000 || a == 0x9000 || a == 0xB000) scc++;
-        if (a == 0x7000) { scc++; ascii8++; ascii16++; }
-        if (a == 0x6800 || a == 0x7800) ascii8++;
+        switch (a) {
+            case 0x6000: konami++; ascii8++; ascii16++; break;
+            case 0x8000: case 0xA000: konami++; break;
+            case 0x5000: case 0x9000: case 0xB000: scc++; break;
+            case 0x7000: scc++; ascii8++; ascii16++; break;
+            case 0x6800: case 0x7800: ascii8++; break;
+            case 0x77FF: ascii16++; break;
+            default: break;
+        }
     }
-    int best = scc; RomMapper m = RomMapper::KonamiSCC;
-    if (konami > best) { best = konami; m = RomMapper::Konami; }
+    // Ties go to the mapper whose registers are a subset of the others'
+    // (ASCII16 before ASCII8: a pure 0x6000/0x7000 game is ASCII16).
+    int best = ascii16; RomMapper m = RomMapper::ASCII16;
     if (ascii8 > best) { best = ascii8; m = RomMapper::ASCII8; }
-    if (ascii16 > best) { best = ascii16; m = RomMapper::ASCII16; }
+    if (konami > best) { best = konami; m = RomMapper::Konami; }
+    if (scc > best)    { best = scc;    m = RomMapper::KonamiSCC; }
     if (best == 0) {
-        if (d.size() <= 0x8000) return RomMapper::None;
+        // No bank switching found: a 48/64K ROM can still be plain (mirrored
+        // over pages 0-3); anything bigger must bank somehow.
+        if (d.size() <= 0x10000) return RomMapper::None;
         return RomMapper::Unknown;
     }
     return m;
