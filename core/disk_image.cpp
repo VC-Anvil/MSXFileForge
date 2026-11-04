@@ -43,27 +43,36 @@ static bool hasExt(const std::string& p, const char* ext) {
 }
 
 bool DiskImage::load(const std::string& path, std::string* err) {
-    path_ = path;
-    format_ = DiskFormat::Unknown;
-    raw_.clear(); sectors_.clear(); lba_.clear();
-    cylinders_ = heads_ = spt_ = 0; protectedFlags_ = false;
-
-    if (!readWhole(path, raw_)) { if (err) *err = "cannot read file"; return false; }
-
-    // DMK is identified by extension + a plausible 16-byte header. Everything
-    // else is treated as a flat sector dump.
-    bool looksDmk = hasExt(path, ".dmk");
-    if (!looksDmk && raw_.size() >= 16) {
-        // A DMK track length at [2..3] that divides the body cleanly is a hint,
-        // but we only auto-detect on extension to avoid mis-reading .dsk files.
+    std::vector<uint8_t> bytes;
+    if (!readWhole(path, bytes)) {
+        path_ = path; format_ = DiskFormat::Unknown;
+        raw_.clear(); sectors_.clear(); lba_.clear();
+        if (err) *err = "cannot read file";
+        return false;
     }
+    return loadBytes(std::move(bytes), path, err);
+}
 
-    if (looksDmk) {
+bool DiskImage::loadBytes(std::vector<uint8_t> bytes, const std::string& nameHint,
+                          std::string* err) {
+    path_ = nameHint;
+    format_ = DiskFormat::Unknown;
+    raw_ = std::move(bytes);
+    sectors_.clear(); lba_.clear();
+    cylinders_ = heads_ = spt_ = 0; protectedFlags_ = false; dirty_ = false;
+    if (err) err->clear();
+
+    // DMK is identified by extension only, to avoid mis-reading .dsk files
+    // whose first bytes happen to look like a DMK header.
+    if (hasExt(nameHint, ".dmk")) {
         if (parseDmk(err)) { format_ = DiskFormat::DMK; return true; }
         // Fall through: some ".dmk" files are actually plain dumps.
+        sectors_.clear(); lba_.clear();
+        cylinders_ = heads_ = spt_ = 0; protectedFlags_ = false;
     }
-    if (parsePlain(err)) return true;
+    if (parsePlain(err)) { if (err) err->clear(); return true; }
     if (err && err->empty()) *err = "unrecognized disk image";
+    raw_.clear();
     return false;
 }
 

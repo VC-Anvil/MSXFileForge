@@ -74,6 +74,23 @@ public:
     bool createFile(const std::string& dirPath, const std::string& name,
                     const std::vector<uint8_t>& data, std::string* err = nullptr);
 
+    // Remove an EMPTY subdirectory (only "." and ".." left) and free its chain.
+    bool removeDir(const DirEntry& e, std::string* err = nullptr);
+
+    // Find a file or directory by path ("/GAMES/SAVE/SLOT1.DAT", case-insensitive).
+    // Returns false if any component is missing.
+    bool lookup(const std::string& path, DirEntry& out) const;
+
+    // True if `name` is a legal MSX-DOS 8.3 name (1-8 char base, optional 1-3
+    // char extension, no spaces or reserved characters). Case-insensitive.
+    static bool validName83(const std::string& name, std::string* err = nullptr);
+
+    // Timestamp written into new/modified directory entries (FAT date/time
+    // words). By default the current local time is used; a fixed stamp makes
+    // output reproducible (tests, deterministic builds).
+    void setTimestamp(uint16_t date, uint16_t time) { fixedDate_ = date; fixedTime_ = time; fixedStamp_ = true; }
+    void useCurrentTime() { fixedStamp_ = false; }
+
     // Rename an entry in place (8.3). Updates `e`.
     bool renameEntry(DirEntry& e, const std::string& newName, std::string* err = nullptr);
 
@@ -121,6 +138,11 @@ private:
     long freeDirSlot(int dirCluster);                       // image offset or -1
     void writeDirEntry(long off, const uint8_t name11[11], uint8_t attr,
                        uint16_t cluster, uint32_t size);
+    void stamp(uint16_t& date, uint16_t& time) const;
+    int  countFreeClusters() const;
+    bool nameTaken(int dirCluster, const uint8_t name11[11], long ignoreOffset = -1) const;
+    std::vector<DirEntry> readDir(int dirCluster, bool includeDeleted) const;
+    bool mountFromMediaByte(std::string* err);
     static void pack83(const std::string& name, uint8_t out[11]);
     void collectNamedClusters(int cluster, std::vector<uint8_t>& status, bool isRoot) const;
     bool writeByteAt(long imageOffset, uint8_t value);
@@ -133,7 +155,6 @@ private:
     std::vector<DirEntry> readRootDir(bool includeDeleted) const;
     int fatEntry(int cluster) const;
     bool sectorBytes(long lba, uint8_t out[512]) const;
-    const DirEntry* resolve(const std::string& path) const;
     static std::vector<DirEntry> parseEntries(const std::vector<uint8_t>& buf,
                                               long baseOffset, bool includeDeleted);
 
@@ -145,6 +166,8 @@ private:
     long fatStartSec_ = 0, rootStartSec_ = 0, dataStartSec_ = 0;
     int rootSectors_ = 0;
     std::string volLabel_, oem_;
+    bool fixedStamp_ = false;
+    uint16_t fixedDate_ = 0, fixedTime_ = 0;
 };
 
 } // namespace msx

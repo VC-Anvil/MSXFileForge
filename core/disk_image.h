@@ -42,6 +42,10 @@ struct SectorInfo {
 class DiskImage {
 public:
     bool load(const std::string& path, std::string* err = nullptr);
+    // Same as load() but from bytes already in memory. `nameHint` is only used
+    // for its extension (".dmk" selects the track-image parser).
+    bool loadBytes(std::vector<uint8_t> bytes, const std::string& nameHint,
+                   std::string* err = nullptr);
 
     bool loaded() const { return !raw_.empty(); }
     DiskFormat format() const { return format_; }
