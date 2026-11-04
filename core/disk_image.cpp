@@ -390,6 +390,12 @@ bool DiskImage::writeLogicalSector(long lba, const uint8_t in[512]) {
     if (lba < 0 || lba >= (long)lba_.size()) return false;
     long off = lba_[(size_t)lba];
     if (off < 0 || off + 512 > (long)raw_.size()) return false;
+    // DMK: a sector whose data field runs past its track end stays readable,
+    // but writing it would clobber the next track's header, so refuse.
+    if (format_ == DiskFormat::DMK) {
+        if ((size_t)lba >= lbaSector_.size() || lbaSector_[(size_t)lba] < 0) return false;
+        if (sectors_[(size_t)lbaSector_[(size_t)lba]].markOffset < 0) return false;
+    }
     memcpy(raw_.data() + off, in, 512);
     // DMK: keep the data CRC valid, unless the sector carried a deliberate CRC
     // error (copy protection), which is preserved as found.

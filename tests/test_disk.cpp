@@ -256,3 +256,27 @@ TEST(dmk_rejects_unknown_geometry) {
     CHECK(dskToDmk(Bytes(1000 * 512, 0), &err).empty());
     CHECK(!err.empty());
 }
+
+TEST(dmk_sector_running_off_track_is_read_only) {
+    std::string err;
+    Bytes dmk = dskToDmk(sampleDsk(), &err);
+    long to = trackOffset(dmk, 0, 0);
+    int len = dmk[2] | (dmk[3] << 8);
+    // Move sector 9's header near the end of the track so its data runs past it.
+    long idam = idamOffset(dmk, 0, 0, 8);
+    long dst = to + len - 20;
+    memmove(&dmk[(size_t)dst], &dmk[(size_t)idam], 7);
+    dmk[(size_t)dst + 7] = 0xFB;
+    uint16_t ptr = (uint16_t)((dst - to) | 0x8000);
+    dmk[(size_t)to + 16] = ptr & 0xFF; dmk[(size_t)to + 17] = ptr >> 8;
+    DiskImage dk;
+    CHECK(dk.loadBytes(dmk, "x.dmk", &err));
+    CHECK(dk.isProtected());
+    uint8_t buf[512];
+    memset(buf, 0x33, sizeof buf);
+    CHECK(!dk.writeLogicalSector(8, buf));     // would overwrite the next track
+    CHECK(dk.writeLogicalSector(7, buf));
+    DiskImage again;
+    CHECK(again.loadBytes(dk.raw(), "y.dmk", &err));
+    CHECK(again.readSector(9, buf));          // C0 H1 S1 still intact
+}

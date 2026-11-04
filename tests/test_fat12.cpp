@@ -375,3 +375,114 @@ TEST(fat12_dir_entry_strings) {
     CHECK_EQ(e.timeString(), std::string("13:45:30"));
     CHECK_EQ(e.attrString(), std::string("R----A"));
 }
+
+// ---- Regressions found in review ------------------------------------------
+
+TEST(fat12_entry_offsets_in_split_subdirectory) {
+    // A directory whose second cluster is not adjacent to the first: entries
+    // there used to get the offset of the wrong place on disk, so put/delete/
+    // rename wrote into another file's data.
+    Disk d;
+    std::string err;
+    CHECK(d.fs.makeDir("/", "SUB", &err));
+    auto other = pattern(1024, 77);
+    CHECK(d.fs.createFile("/", "OTHER.DAT", other, &err));   // the cluster right after SUB
+    for (int i = 0; i < 31; ++i) {                            // spills into a new cluster
+        char nm[16]; snprintf(nm, sizeof nm, "F%02d.TXT", i);
+        CHECK(d.fs.createFile("/SUB", nm, pattern(10, (uint8_t)i), &err));
+    }
+    DirEntry f;
+    CHECK(d.find("/SUB/F30.TXT", f));
+    CHECK(d.fs.writeFile(f, pattern(3000, 5), &err));
+    DirEntry o; CHECK(d.find("/OTHER.DAT", o));
+    CHECK(d.fs.readFile(o) == other);
+    CHECK(d.find("/SUB/F30.TXT", f));
+    CHECK(d.fs.readFile(f) == pattern(3000, 5));
+    CHECK(clean(d.fs));
+    // Delete everything in SUB, then SUB itself.
+    for (int i = 0; i < 31; ++i) {
+        char nm[24]; snprintf(nm, sizeof nm, "/SUB/F%02d.TXT", i);
+        DirEntry e; CHECK(d.find(nm, e)); CHECK(d.fs.deleteFile(e, &err));
+    }
+    CHECK(d.find("/OTHER.DAT", o)); CHECK(d.fs.readFile(o) == other);
+    DirEntry sub; CHECK(d.find("/SUB", sub));
+    CHECK(d.fs.removeDir(sub, &err));
+    CHECK_EQ(d.fs.freeBytes(), (713L - 1) * 1024);
+    CHECK(clean(d.fs));
+}
+
+TEST(fat12_dot_entries_cannot_be_removed_or_renamed) {
+    Disk d;
+    std::string err;
+    CHECK(d.fs.makeDir("/", "SUB", &err));
+    DirEntry e;
+    CHECK(!d.find("/SUB/.", e));
+    CHECK(!d.find("/SUB/..", e));
+    for (auto& x : d.fs.list("/SUB")) {
+        DirEntry y = x;
+        CHECK(!d.fs.removeDir(x, &err));
+        CHECK(!d.fs.renameEntry(y, "LOOP", &err));
+        CHECK(!d.fs.deleteFile(x, &err));
+    }
+    CHECK(clean(d.fs));
+}
+
+TEST(fat12_media_fallback_clamped_to_image_and_failed_write_frees) {
+    // A 360K dump whose (BPB-less) FAT claims the 720K media byte: mount must
+    // not address sectors past the end, and a write that cannot fit leaves
+    // the free space unchanged.
+    std::string err;
+    auto img = formatBlankImage(1440);
+    img.resize(720 * 512);
+    memset(img.data() + 3, 0, 0x1E - 3);
+    DiskImage dk; Fat12 fs;
+    CHECK(dk.loadBytes(img, "half.dsk", &err));
+    CHECK(fs.mount(dk, &err));
+    CHECK_EQ(fs.totalClusters(), (720 - 1 - 6 - 7) / 2);
+    long before = fs.freeBytes();
+    CHECK(!fs.createFile("/", "BIG.BIN", pattern(500 * 1024, 1), &err));
+    CHECK_EQ(fs.freeBytes(), before);
+    CHECK(fs.verify().issues.empty());
+    CHECK_EQ(fs.verify().unreferenced, 0L);
+}
+
+TEST(fat12_write_repairs_looping_chain_instead_of_freeing_it) {
+    Disk d;
+    std::string err;
+    CHECK(d.fs.createFile("/", "A.BIN", pattern(3000, 1), &err)); // clusters 2,3,4
+    DirEntry a; CHECK(d.find("/A.BIN", a));
+    // Corrupt: last cluster points back to the first.
+    long fat = 512;
+    auto& raw = d.dk.rawMut();
+    for (int f = 0; f < 2; ++f) {               // FAT[4] = 2  (even entry: low 12 bits)
+        long o = fat + f * 3 * 512 + 4 + 4 / 2;
+        raw[(size_t)o] = 0x02; raw[(size_t)o + 1] = (uint8_t)((raw[(size_t)o + 1] & 0xF0));
+    }
+    CHECK(!d.fs.verify().issues.empty());
+    CHECK(d.fs.writeFile(a, pattern(100, 2), &err));
+    CHECK(d.find("/A.BIN", a));
+    CHECK(d.fs.readFile(a) == pattern(100, 2));
+    CHECK(clean(d.fs));
+    CHECK_EQ(d.fs.freeBytes(), (713L - 1) * 1024);
+}
+
+TEST(fat12_full_directory_growth_is_accounted) {
+    // Fill the disk so exactly one cluster is free.
+    Disk d(720);
+    std::string err;
+    CHECK(d.fs.makeDir("/", "SUB", &err));
+    for (int i = 0; i < 30; ++i) {              // "." + ".." + 30 = one full cluster
+        char nm[16]; snprintf(nm, sizeof nm, "F%02d", i);
+        CHECK(d.fs.createFile("/SUB", nm, {}, &err));
+    }
+    CHECK(d.fs.createFile("/", "FILL.BIN", pattern((size_t)d.fs.freeBytes() - 1024, 1), &err));
+    CHECK_EQ(d.fs.freeBytes(), 1024L);
+    // Creating a 1-cluster file in the full SUB needs 2 clusters: refuse cleanly.
+    CHECK(!d.fs.createFile("/SUB", "X", pattern(100, 2), &err));
+    CHECK_EQ(d.fs.freeBytes(), 1024L);
+    // A subdirectory with a free slot only needs 1 cluster for a new folder.
+    DirEntry f; CHECK(d.find("/SUB/F00", f)); CHECK(d.fs.deleteFile(f, &err));
+    CHECK(d.fs.makeDir("/SUB", "INNER", &err));
+    CHECK_EQ(d.fs.freeBytes(), 0L);
+    CHECK(clean(d.fs));
+}

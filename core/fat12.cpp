@@ -119,6 +119,12 @@ bool Fat12::mount(DiskImage& disk, std::string* err) {
         if (!mountFromMediaByte(err)) return false;
     }
 
+    // Never address sectors the container does not have (a truncated image, or
+    // a media-byte guess larger than the dump). DMK images may legitimately
+    // end in unreadable holes, so their logical size is not a cap.
+    if (disk.format() != DiskFormat::DMK && totalSectors_ > disk.logicalSectors())
+        totalSectors_ = (int)disk.logicalSectors();
+
     fatStartSec_  = rsvd_;
     rootStartSec_ = rsvd_ + (long)nfat_ * spf_;
     rootSectors_  = (ndir_ * 32 + bps_ - 1) / bps_;
@@ -158,11 +164,12 @@ int Fat12::fatEntry(int cluster) const {
 }
 
 std::vector<DirEntry> Fat12::parseEntries(const std::vector<uint8_t>& buf,
-                                          long baseOffset, bool includeDeleted) {
+                                          long baseOffset, bool includeDeleted, bool* ended) {
     std::vector<DirEntry> out;
+    if (ended) *ended = false;
     for (size_t i = 0; i + 32 <= buf.size(); i += 32) {
         const uint8_t* e = buf.data() + i;
-        if (e[0] == 0x00) break;             // end of directory
+        if (e[0] == 0x00) { if (ended) *ended = true; break; } // end of directory
         bool del = (e[0] == 0xE5);
         if (del && !includeDeleted) continue;
         uint8_t attr = e[0x0B];
@@ -199,20 +206,23 @@ std::vector<DirEntry> Fat12::readRootDir(bool includeDeleted) const {
 }
 
 std::vector<DirEntry> Fat12::readDirAtCluster(int cluster, bool includeDeleted) const {
-    std::vector<uint8_t> buf;
-    long firstBase = -1;
-    int guard = 0;
-    while (cluster >= 2 && cluster < 0xFF8 && guard++ < totalClusters_ + 4) {
-        long firstSec = dataStartSec_ + (long)(cluster - 2) * spc_;
+    // Parse cluster by cluster: a grown directory's clusters are usually not
+    // adjacent, so each entry's offset must come from its own cluster.
+    std::vector<DirEntry> out;
+    for (int c : chainOf(cluster)) {
+        std::vector<uint8_t> buf;
+        long firstSec = dataStartSec_ + (long)(c - 2) * spc_;
         for (int s = 0; s < spc_; ++s) {
             uint8_t sec[512];
             if (!sectorBytes(firstSec + s, sec)) break;
-            if (firstBase < 0) firstBase = (firstSec + s) * 512;
             buf.insert(buf.end(), sec, sec + 512);
         }
-        cluster = fatEntry(cluster);
+        bool ended = false;
+        auto part = parseEntries(buf, firstSec * 512, includeDeleted, &ended);
+        out.insert(out.end(), part.begin(), part.end());
+        if (ended || buf.size() < (size_t)spc_ * 512) break;
     }
-    return parseEntries(buf, firstBase, includeDeleted);
+    return out;
 }
 
 std::vector<DirEntry> Fat12::readDir(int dirCluster, bool includeDeleted) const {
@@ -224,7 +234,7 @@ bool Fat12::lookup(const std::string& path, DirEntry& out) const {
     size_t cut = path.find_last_of("/\\");
     std::string dir = (cut == std::string::npos) ? "/" : path.substr(0, cut);
     std::string leaf = (cut == std::string::npos) ? path : path.substr(cut + 1);
-    if (leaf.empty()) return false;
+    if (leaf.empty() || leaf == "." || leaf == "..") return false;
     int dc = resolveDirCluster(dir);
     if (dc < 0) return false;
     for (char& c : leaf) c = (char)toupper((unsigned char)c);
@@ -344,9 +354,13 @@ int Fat12::allocCluster() {
 }
 
 std::vector<int> Fat12::chainOf(int startCluster) const {
+    // Stops at the end marker, at an out-of-range value, or when a corrupt FAT
+    // loops back to a cluster already in the chain.
     std::vector<int> chain;
-    int c = startCluster, guard = 0;
-    while (c >= 2 && c < 0xFF8 && guard++ < totalClusters_ + 8) {
+    std::vector<bool> seen((size_t)totalClusters_ + 2, false);
+    int c = startCluster;
+    while (c >= 2 && c < totalClusters_ + 2 && !seen[(size_t)c]) {
+        seen[(size_t)c] = true;
         chain.push_back(c);
         c = fatEntry(c);
     }
@@ -410,9 +424,13 @@ bool Fat12::writeFile(DirEntry& e, const std::vector<uint8_t>& data, std::string
         return false;
     }
     int needClusters = (int)needL;
+    const size_t oldLen = chain.size();
+    auto releaseNew = [&]() {                  // undo this call's allocations
+        for (size_t i = oldLen; i < chain.size(); ++i) setFatEntry(chain[i], 0);
+    };
     while ((int)chain.size() < needClusters) {
         int nc = allocCluster();
-        if (nc < 0) { if (err) *err = "disk full (no free clusters)"; return false; }
+        if (nc < 0) { releaseNew(); if (err) *err = "disk full (no free clusters)"; return false; }
         setFatEntry(nc, 0xFFF); // reserve immediately so the next alloc skips it
         chain.push_back(nc);
     }
@@ -422,7 +440,8 @@ bool Fat12::writeFile(DirEntry& e, const std::vector<uint8_t>& data, std::string
         long off = (long)i * clusterBytes;
         long len = (long)data.size() - off; if (len > clusterBytes) len = clusterBytes;
         if (!writeClusterData(chain[i], data.data() + off, len)) {
-            if (err) *err = "write error";
+            releaseNew();
+            if (err) *err = "write error (sector not writable)";
             return false;
         }
     }
@@ -460,7 +479,10 @@ bool Fat12::writeFile(DirEntry& e, const std::vector<uint8_t>& data, std::string
 bool Fat12::deleteFile(const DirEntry& e, std::string* err) {
     if (!mounted_) { if (err) *err = "not mounted"; return false; }
     if (e.isDir()) { if (err) *err = "refusing to delete a directory (use removeDir)"; return false; }
-    if (e.deleted || e.entryOffset < 0) { if (err) *err = "entry is not a live file"; return false; }
+    if (e.deleted || e.entryOffset < 0 || (!e.raw83.empty() && e.raw83[0] == '.')) {
+        if (err) *err = "entry is not a live file";
+        return false;
+    }
     for (int c : chainOf(e.startCluster)) setFatEntry(c, 0);
     writeByteAt(e.entryOffset, 0xE5); // mark deleted
     return true;
@@ -468,8 +490,9 @@ bool Fat12::deleteFile(const DirEntry& e, std::string* err) {
 
 bool Fat12::removeDir(const DirEntry& e, std::string* err) {
     if (!mounted_) { if (err) *err = "not mounted"; return false; }
-    if (!e.isDir() || e.deleted || e.entryOffset < 0 || e.startCluster < 2) {
-        if (err) *err = "not a subdirectory";
+    if (!e.isDir() || e.deleted || e.entryOffset < 0 || e.startCluster < 2 ||
+        (!e.raw83.empty() && e.raw83[0] == '.')) {
+        if (err) *err = "not a removable subdirectory";
         return false;
     }
     for (auto& c : readDirAtCluster(e.startCluster, false)) {
@@ -630,7 +653,7 @@ int Fat12::resolveDirCluster(const std::string& path) const {
     return cluster;
 }
 
-long Fat12::freeDirSlot(int dirCluster) {
+long Fat12::freeDirSlot(int dirCluster, bool allowGrow) {
     if (dirCluster == 0) {
         for (int i = 0; i < ndir_; ++i) {
             long off = rootStartSec_ * 512 + (long)i * 32;
@@ -650,7 +673,7 @@ long Fat12::freeDirSlot(int dirCluster) {
         }
     }
     // Subdirectories grow: append a zeroed cluster to the directory's chain.
-    if (chain.empty()) return -1;
+    if (chain.empty() || !allowGrow) return -1;
     int nc = allocCluster();
     if (nc < 0) return -1;
     std::vector<uint8_t> zero((size_t)spc_ * 512, 0);
@@ -685,7 +708,10 @@ bool Fat12::createFile(const std::string& dirPath, const std::string& name,
 
     long clusterBytes = (long)spc_ * 512;
     long need = (long)((data.size() + clusterBytes - 1) / clusterBytes);
-    if (need > countFreeClusters()) { if (err) *err = "disk full (no free clusters)"; return false; }
+    // Growing a full subdirectory costs one more cluster: count it up front so
+    // a failed create leaves the directory as it was.
+    bool grow = dc != 0 && freeDirSlot(dc, false) < 0;
+    if (need + (grow ? 1 : 0) > countFreeClusters()) { if (err) *err = "disk full (no free clusters)"; return false; }
     long slot = freeDirSlot(dc);
     if (slot < 0) { if (err) *err = "directory is full"; return false; }
     uint8_t prevFirst = 0; readByteAt(slot, prevFirst);
@@ -702,7 +728,10 @@ bool Fat12::createFile(const std::string& dirPath, const std::string& name,
 }
 
 bool Fat12::renameEntry(DirEntry& e, const std::string& newName, std::string* err) {
-    if (!mounted_ || e.entryOffset < 0 || e.deleted) { if (err) *err = "cannot rename"; return false; }
+    if (!mounted_ || e.entryOffset < 0 || e.deleted || (!e.raw83.empty() && e.raw83[0] == '.')) {
+        if (err) *err = "cannot rename";
+        return false;
+    }
     if (!validName83(newName, err)) return false;
     uint8_t nm[11]; pack83(newName, nm);
     // The entry's own directory: find it by scanning for the record offset.
@@ -737,7 +766,8 @@ bool Fat12::makeDir(const std::string& parentPath, const std::string& name, std:
     if (parent < 0) { if (err) *err = "parent directory not found"; return false; }
     uint8_t nm[11]; pack83(name, nm);
     if (nameTaken(parent, nm)) { if (err) *err = "name already exists"; return false; }
-    if (countFreeClusters() < (parent != 0 ? 2 : 1)) { if (err) *err = "disk full"; return false; }
+    bool grow = parent != 0 && freeDirSlot(parent, false) < 0;
+    if (countFreeClusters() < (grow ? 2 : 1)) { if (err) *err = "disk full"; return false; }
     long slot = freeDirSlot(parent);
     if (slot < 0) { if (err) *err = "parent directory is full"; return false; }
     int nc = allocCluster();

@@ -13,6 +13,7 @@
 #include "../core/cas.h"
 #include "../core/util.h"
 #include "../core/tape.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -344,15 +345,19 @@ static int cmd_fsck(const char* img) {
     return c.issues.empty() ? 0 : 1;
 }
 
-// Every file on the disk as "/DIR/NAME" -> entry (directories walked).
+// Every file on the disk as "/DIR/NAME" -> entry (directories walked once
+// each, so a corrupt tree that links back to an ancestor cannot loop).
 static void allFiles(const Fat12& fs, const std::string& dir,
-                     std::vector<std::pair<std::string, DirEntry>>& out, int depth = 0) {
-    if (depth > 16) return;   // corrupt trees can loop
+                     std::vector<std::pair<std::string, DirEntry>>& out,
+                     std::vector<int>& seenDirs) {
     for (auto& e : fs.list(dir, false)) {
         if (e.isVolume() || e.name == "." || e.name == "..") continue;
         std::string p = (dir == "/" ? "" : dir) + "/" + e.name;
-        if (e.isDir()) allFiles(fs, p, out, depth + 1);
-        else out.push_back({p, e});
+        if (e.isDir()) {
+            if (std::find(seenDirs.begin(), seenDirs.end(), (int)e.startCluster) != seenDirs.end()) continue;
+            seenDirs.push_back((int)e.startCluster);
+            allFiles(fs, p, out, seenDirs);
+        } else out.push_back({p, e});
     }
 }
 
@@ -362,7 +367,8 @@ static int cmd_diff(int argc, char** argv) {
     if ((rc = mountDisk(argv[2], a, fa))) return rc;
     if ((rc = mountDisk(argv[3], b, fb))) return rc;
     std::vector<std::pair<std::string, DirEntry>> la, lb;
-    allFiles(fa, "/", la); allFiles(fb, "/", lb);
+    std::vector<int> sa, sb;
+    allFiles(fa, "/", la, sa); allFiles(fb, "/", lb, sb);
     auto findIn = [](std::vector<std::pair<std::string, DirEntry>>& l, const std::string& n) -> DirEntry* {
         for (auto& e : l) if (e.first == n) return &e.second;
         return nullptr;

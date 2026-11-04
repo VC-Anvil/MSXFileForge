@@ -135,7 +135,7 @@ public:
 
 private:
     int  resolveDirCluster(const std::string& path) const; // 0=root, -1=not found
-    long freeDirSlot(int dirCluster);                       // image offset or -1
+    long freeDirSlot(int dirCluster, bool allowGrow = true); // logical offset or -1
     void writeDirEntry(long off, const uint8_t name11[11], uint8_t attr,
                        uint16_t cluster, uint32_t size);
     void stamp(uint16_t& date, uint16_t& time) const;
@@ -156,7 +156,8 @@ private:
     int fatEntry(int cluster) const;
     bool sectorBytes(long lba, uint8_t out[512]) const;
     static std::vector<DirEntry> parseEntries(const std::vector<uint8_t>& buf,
-                                              long baseOffset, bool includeDeleted);
+                                              long baseOffset, bool includeDeleted,
+                                              bool* ended = nullptr);
 
     DiskImage* disk_ = nullptr;
     bool mounted_ = false;
