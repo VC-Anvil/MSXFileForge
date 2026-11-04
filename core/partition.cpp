@@ -45,48 +45,66 @@ std::vector<Partition> findPartitions(const DiskImage& disk) {
     uint8_t mbr[512];
     if (!disk.readSector(0, mbr) || mbr[510] != 0x55 || mbr[511] != 0xAA) return out;
     if (looksLikeFatBoot(mbr)) return out;              // superfloppy
-    long total = disk.logicalSectors();
+    const int64_t total = disk.logicalSectors();
+    // Floppy-sized images are never partitioned: boot code there can contain
+    // 0x55AA and bytes at 0x1BE that happen to look like a table.
+    if (total <= 2 * 2880) return out;
+    uint8_t s1[512];                                    // FAT right after a boot sector?
+    if (disk.readSector(1, s1) && s1[0] >= 0xF8 && s1[1] == 0xFF && s1[2] == 0xFF) return out;
 
-    auto valid = [&](const uint8_t* e, long base) {
-        long start = base + (long)rd32(e + 8), count = (long)rd32(e + 12);
-        return (e[0] == 0x00 || e[0] == 0x80) && e[4] != 0 && rd32(e + 8) > 0 && count > 0 &&
-               start + count <= total;
+    // Fields are unsigned 32-bit; all arithmetic in 64 bits (long is 32-bit on
+    // Windows) and every result must fit a positive long.
+    auto field = [](const uint8_t* e, int off) { return (int64_t)rd32(e + off); };
+    auto valid = [&](const uint8_t* e, int64_t base, int64_t lo, int64_t hi) {
+        int64_t start = base + field(e, 8), count = field(e, 12);
+        return (e[0] == 0x00 || e[0] == 0x80) && e[4] != 0 && field(e, 8) > 0 && count > 0 &&
+               start >= lo && start + count <= hi && start + count <= 0x7FFFFFFF;
     };
-    // Every non-empty entry must be well formed, or this is not an MBR.
     std::vector<const uint8_t*> prim;
     for (int i = 0; i < 4; ++i) {
         const uint8_t* e = mbr + 0x1BE + i * 16;
         if (e[4] == 0) continue;
-        if (!valid(e, 0)) return {};
+        if (!valid(e, 0, 1, total)) return {};           // malformed: not an MBR
         prim.push_back(e);
     }
     if (prim.empty()) return out;
 
+    auto overlaps = [&](int64_t a, int64_t n) {
+        for (auto& p : out)
+            if (a < (int64_t)p.firstSector + p.sectorCount && (int64_t)p.firstSector < a + n) return true;
+        return false;
+    };
     int number = 0;
-    long extStart = -1;
+    int64_t extStart = -1, extEnd = -1;
     for (const uint8_t* e : prim) {
-        if (isExtended(e[4])) { if (extStart < 0) extStart = (long)rd32(e + 8); continue; }
+        if (isExtended(e[4])) {
+            if (extStart < 0) { extStart = field(e, 8); extEnd = extStart + field(e, 12); }
+            continue;
+        }
+        if (overlaps(field(e, 8), field(e, 12))) continue;   // never expose two views of one area
         Partition p;
         p.number = ++number; p.type = e[4];
-        p.firstSector = (long)rd32(e + 8); p.sectorCount = (long)rd32(e + 12);
+        p.firstSector = (long)field(e, 8); p.sectorCount = (long)field(e, 12);
         out.push_back(p);
     }
     // Logical drives: a chain of EBRs. Entry 0 = the drive (relative to this
-    // EBR), entry 1 = the next EBR (relative to the extended partition).
-    std::set<long> seen;
-    long ebr = extStart;
-    while (ebr > 0 && ebr < total && seen.insert(ebr).second && seen.size() < 256) {
+    // EBR), entry 1 = the next EBR (relative to the extended partition). Both
+    // must stay inside the extended partition.
+    std::set<int64_t> seen;
+    int64_t ebr = extStart;
+    while (ebr > 0 && ebr < extEnd && seen.insert(ebr).second && seen.size() <= 4096) {
         uint8_t s[512];
-        if (!disk.readSector(ebr, s) || s[510] != 0x55 || s[511] != 0xAA) break;
+        if (!disk.readSector((long)ebr, s) || s[510] != 0x55 || s[511] != 0xAA) break;
         const uint8_t* e0 = s + 0x1BE;
         const uint8_t* e1 = s + 0x1CE;
-        if (e0[4] != 0 && valid(e0, ebr)) {
+        if (e0[4] != 0 && !isExtended(e0[4]) && valid(e0, ebr, ebr + 1, extEnd) &&
+            !overlaps(ebr + field(e0, 8), field(e0, 12))) {
             Partition p;
             p.number = ++number; p.type = e0[4]; p.logical = true;
-            p.firstSector = ebr + (long)rd32(e0 + 8); p.sectorCount = (long)rd32(e0 + 12);
+            p.firstSector = (long)(ebr + field(e0, 8)); p.sectorCount = (long)field(e0, 12);
             out.push_back(p);
         }
-        ebr = (e1[4] != 0 && isExtended(e1[4])) ? extStart + (long)rd32(e1 + 8) : -1;
+        ebr = (e1[4] != 0 && isExtended(e1[4])) ? extStart + field(e1, 8) : -1;
     }
     return out;
 }
@@ -107,7 +125,15 @@ std::vector<uint8_t> formatFatVolume(long totalSectors, long hiddenSectors, cons
             long bytes = f16 ? (n + 2) * 2 : ((n + 2) * 3 + 1) / 2;
             fatSecs = (bytes + 511) / 512;
         }
-        return (totalSectors - rsvd - nfat * fatSecs - rootSecs) / c;
+        n = (totalSectors - rsvd - nfat * fatSecs - rootSecs) / c;
+        // The iteration can settle one sector short; grow the FAT until it
+        // holds every cluster the BPB implies.
+        auto need = [&](long k) { return f16 ? (k + 2) * 2 : ((k + 2) * 3 + 1) / 2; };
+        while (n > 0 && need(n) > fatSecs * 512) {
+            ++fatSecs;
+            n = (totalSectors - rsvd - nfat * fatSecs - rootSecs) / c;
+        }
+        return n;
     };
     bool fat16 = false;
     int spc = 0;

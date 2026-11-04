@@ -213,7 +213,10 @@ static bool mountCurrent(App& a, std::string& err) {
     if (a.parts.empty()) return a.fs.mount(a.disk, &err);
     if (a.partIdx < 0 || a.partIdx >= (int)a.parts.size()) a.partIdx = 0;
     const Partition& p = a.parts[(size_t)a.partIdx];
-    return a.fs.mount(a.disk, p.firstSector, p.sectorCount, &err);
+    if (a.fs.mount(a.disk, p.firstSector, p.sectorCount, &err)) return true;
+    std::string plain;   // junk "table" in a floppy boot sector: read the image as one volume
+    if (a.fs.mount(a.disk, &plain)) { a.parts.clear(); err.clear(); return true; }
+    return false;
 }
 
 static void openPath(App& a, const std::string& path) {

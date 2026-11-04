@@ -26,7 +26,7 @@ struct DirEntry {
     uint32_t size = 0;
     uint16_t date = 0, time = 0;
     bool deleted = false;  // first byte 0xE5 (recoverable)
-    long entryOffset = -1; // byte offset of the 32-byte record in the image
+    long entryOffset = -1; // byte offset of the 32-byte record, relative to the volume
 
     bool isDir() const { return (attr & 0x10) != 0; }
     bool isVolume() const { return (attr & 0x08) != 0; }
@@ -156,7 +156,8 @@ public:
     // Total bytes available in the RAW region (allocated-but-unnamed clusters).
     long rawUnnamedCapacity() const;
 
-    // Byte offset in the image where a data cluster begins (for the raw viewer).
+    // Byte offset where a data cluster begins, relative to the volume (add
+    // volumeStart() * 512 for the position in the image).
     long clusterByteOffset(int cluster) const;
 
     int firstDataCluster() const { return 2; }
@@ -196,6 +197,11 @@ private:
     bool fat16_ = false;
     int eoc_ = 0xFFF, eocMin_ = 0xFF8, bad_ = 0xFF7, rsvMin_ = 0xFF0; // per FAT width
     long partBase_ = 0, partLimit_ = 0;
+    int nextFree_ = 2;                          // no free cluster below this one
+    mutable long cacheLba_ = -1;                // one-sector read cache
+    mutable const DiskImage* cacheDisk_ = nullptr;
+    mutable uint64_t cacheGen_ = 0;
+    mutable uint8_t cache_[512] = {0};
     uint8_t media_ = 0;
     long fatStartSec_ = 0, rootStartSec_ = 0, dataStartSec_ = 0;
     int rootSectors_ = 0;

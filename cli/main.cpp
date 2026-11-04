@@ -63,7 +63,12 @@ static bool mountVolume(DiskImage& dk, Fat12& fs, std::string& err) {
         for (auto& x : parts) if (x.fat()) { p = &x; break; }
         if (!p) { err = "no FAT partition on this disk"; return false; }
     }
-    return fs.mount(dk, p->firstSector, p->sectorCount, &err);
+    if (fs.mount(dk, p->firstSector, p->sectorCount, &err)) return true;
+    // A table that is really junk in a floppy's boot sector: try the image as a
+    // plain volume before giving up (only when no partition was asked for).
+    std::string plain;
+    if (g_part == 0 && fs.mount(dk, &plain)) return true;
+    return false;
 }
 
 static int mountDisk(const char* path, DiskImage& dk, Fat12& fs) {
@@ -355,6 +360,7 @@ static int cmd_mkhdd(int argc, char** argv) {
         long secs = item.empty() ? 0 : parseSize(item.back() == 'M' || item.back() == 'm' ? item : item + "M");
         if (!secs || secs == 1440 || secs == 720) { fprintf(stderr, "bad partition size '%s' (use e.g. 32M)\n", item.c_str()); return 1; }
         sizes.push_back(secs);
+        if (sizes.size() > 255) { fprintf(stderr, "at most 255 partitions\n"); return 1; }
         if (c == std::string::npos) break;
         p = c + 1;
     }

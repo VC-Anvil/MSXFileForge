@@ -87,7 +87,11 @@ public:
 
     // Mutable container bytes (for the raw hex editor). Does NOT mark dirty by
     // itself - callers that actually change bytes should call markDirty().
-    std::vector<uint8_t>& rawMut() { return raw_; }
+    std::vector<uint8_t>& rawMut() { ++generation_; return raw_; }
+
+    // Bumped by every load and write (and rawMut()), so readers that cache
+    // sectors can tell when the bytes may have changed underneath them.
+    uint64_t generation() const { return generation_; }
 
     // Physical sector table (for the protected/RAW inspector).
     const std::vector<SectorInfo>& sectors() const { return sectors_; }
@@ -115,6 +119,7 @@ private:
     int cylinders_ = 0, heads_ = 0, spt_ = 0;
     bool protectedFlags_ = false;
     bool dirty_ = false;
+    uint64_t generation_ = 0;
 };
 
 } // namespace msx

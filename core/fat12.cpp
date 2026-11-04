@@ -54,14 +54,23 @@ std::string DirEntry::attrString() const {
     return a;
 }
 
+// One-sector read cache: FAT scans read the same sector hundreds of times in
+// a row. Writes go through putSector(), which keeps it coherent.
 bool Fat12::sectorBytes(long lba, uint8_t out[512]) const {
     if (!disk_ || lba < 0 || (partLimit_ > 0 && lba >= partLimit_)) return false;
-    return disk_->readSector(partBase_ + lba, out);
+    if (lba == cacheLba_ && cacheDisk_ == disk_ && cacheGen_ == disk_->generation()) {
+        memcpy(out, cache_, 512); return true;
+    }
+    if (!disk_->readSector(partBase_ + lba, out)) return false;
+    memcpy(cache_, out, 512); cacheLba_ = lba; cacheDisk_ = disk_; cacheGen_ = disk_->generation();
+    return true;
 }
 
 bool Fat12::putSector(long lba, const uint8_t in[512]) {
     if (!disk_ || lba < 0 || (partLimit_ > 0 && lba >= partLimit_)) return false;
-    return disk_->writeLogicalSector(partBase_ + lba, in);
+    if (!disk_->writeLogicalSector(partBase_ + lba, in)) return false;
+    if (lba == cacheLba_ && cacheDisk_ == disk_) { memcpy(cache_, in, 512); cacheGen_ = disk_->generation(); }
+    return true;
 }
 
 // Standard MSX/PC floppy geometries, keyed by the media descriptor byte that
@@ -105,6 +114,7 @@ bool Fat12::mount(DiskImage& disk, std::string* err) {
 bool Fat12::mount(DiskImage& disk, long firstSector, long sectorCount, std::string* err) {
     disk_ = &disk;
     mounted_ = false;
+    cacheLba_ = -1;
     partBase_ = firstSector < 0 ? 0 : firstSector;
     long avail = disk.logicalSectors() - partBase_;
     partLimit_ = (sectorCount > 0 && sectorCount < avail) ? sectorCount : 0;
@@ -118,15 +128,17 @@ bool Fat12::mount(DiskImage& disk, long firstSector, long sectorCount, std::stri
     nfat_ = b[0x10];
     ndir_ = rd16(b + 0x11);
     long total = rd16(b + 0x13);
-    if (total == 0) total = (long)(b[0x20] | (b[0x21] << 8) | (b[0x22] << 16) | ((uint32_t)b[0x23] << 24));
+    // The 32-bit count at 0x20 exists only in DOS 3.31+ BPBs; on MSX-DOS 1
+    // boot sectors those bytes are boot code. Trust it only with an extended
+    // boot signature, or for a large volume the image can actually hold.
+    uint32_t total32 = (uint32_t)(b[0x20] | (b[0x21] << 8) | (b[0x22] << 16) | ((uint32_t)b[0x23] << 24));
+    if (total == 0 && total32 <= 0x7FFFFFFF &&
+        (b[0x26] == 0x28 || b[0x26] == 0x29 || (total32 > 65535 && (long)total32 <= volSectors)))
+        total = (long)total32;
     media_ = b[0x15];
     spf_  = rd16(b + 0x16);
     oem_  = trim(std::string((const char*)b + 3, 8));
 
-    if (bps_ == 512 && spf_ == 0 && (b[0x24] | b[0x25] | b[0x26] | b[0x27])) {
-        if (err) *err = "FAT32 volumes are not supported (MSX-DOS / Nextor use FAT12 and FAT16)";
-        return false;
-    }
     bool bpbOk = bps_ == 512 && isPow2(spc_) && spc_ <= 128 && nfat_ >= 1 && nfat_ <= 4 &&
                  ndir_ > 0 && ndir_ % 16 == 0 && spf_ > 0 && rsvd_ > 0;
     if (bpbOk && total == 0) total = volSectors;
@@ -138,34 +150,51 @@ bool Fat12::mount(DiskImage& disk, long firstSector, long sectorCount, std::stri
     else {
         oem_.clear();
         // Only floppies come without a BPB; a partition always has one.
-        if (partBase_ != 0 || !mountFromMediaByte(err)) {
-            if (err && err->empty()) *err = "not a FAT boot sector";
+        std::string mErr;
+        // (The media-byte table only describes floppies up to 1.44MB.)
+        if (partBase_ != 0 || volSectors > 2 * 2880 || !mountFromMediaByte(&mErr)) {
+            bool fat32 = bps_ == 512 && spf_ == 0 && ndir_ == 0 && isPow2(spc_) &&
+                         nfat_ >= 1 && nfat_ <= 2 && rsvd_ > 0 && rd32(b + 0x24) > 0;
+            if (err) *err = fat32 ? "FAT32 volumes are not supported (MSX-DOS / Nextor use FAT12 and FAT16)"
+                                  : (mErr.empty() ? "not a FAT boot sector" : mErr);
             return false;
         }
     }
+
+    fatStartSec_  = rsvd_;
+    rootStartSec_ = rsvd_ + (long)nfat_ * spf_;
+    rootSectors_  = (ndir_ * 32 + bps_ - 1) / bps_;
+    dataStartSec_ = rootStartSec_ + rootSectors_;
+
+    // The FAT type follows from the cluster count the BPB describes
+    // (Microsoft's rule), BEFORE any clamping to what the container holds: a
+    // truncated FAT16 image is still FAT16. A DMK is a floppy: its geometry
+    // bounds the count.
+    long typeSectors = totalSectors_;
+    if (disk.format() == DiskFormat::DMK) {
+        long geo = (long)disk.cylinders() * disk.heads() * disk.sectorsPerTrack();
+        if (geo > 0 && typeSectors > geo) typeSectors = geo;
+    }
+    long bpbClusters = spc_ > 0 ? (typeSectors - dataStartSec_) / spc_ : 0;
+    fat16_ = bpbClusters >= 4085;
+    if (fat16_) { eoc_ = 0xFFFF; eocMin_ = 0xFFF8; bad_ = 0xFFF7; rsvMin_ = 0xFFF0; }
+    else        { eoc_ = 0xFFF;  eocMin_ = 0xFF8;  bad_ = 0xFF7;  rsvMin_ = 0xFF0; }
 
     // Never address sectors the container does not have (a truncated image, or
     // a media-byte guess larger than the dump). DMK images may legitimately
     // end in unreadable holes, so their logical size is not a cap.
     if (disk.format() != DiskFormat::DMK && totalSectors_ > volSectors)
         totalSectors_ = (int)volSectors;
-
-    fatStartSec_  = rsvd_;
-    rootStartSec_ = rsvd_ + (long)nfat_ * spf_;
-    rootSectors_  = (ndir_ * 32 + bps_ - 1) / bps_;
-    dataStartSec_ = rootStartSec_ + rootSectors_;
-    long dataSectors = totalSectors_ - dataStartSec_;
-    long clusters = spc_ > 0 ? dataSectors / spc_ : 0;
-    // The FAT type follows from the cluster count alone (Microsoft's rule).
-    fat16_ = clusters >= 4085;
-    if (fat16_) { eoc_ = 0xFFFF; eocMin_ = 0xFFF8; bad_ = 0xFFF7; rsvMin_ = 0xFFF0; }
-    else        { eoc_ = 0xFFF;  eocMin_ = 0xFF8;  bad_ = 0xFF7;  rsvMin_ = 0xFF0; }
+    long clusters = spc_ > 0 ? (totalSectors_ - dataStartSec_) / spc_ : 0;
+    if (clusters > bpbClusters) clusters = bpbClusters;
     if (clusters > 65524) clusters = 65524;
     // Never address clusters the FAT cannot hold (1.5 or 2 bytes per entry).
     long fatCapacity = fat16_ ? (long)spf_ * 512 / 2 - 2 : (long)spf_ * 512 * 2 / 3 - 2;
     if (clusters > fatCapacity) clusters = fatCapacity;
     totalClusters_ = (int)clusters;
     if (totalClusters_ < 1) { if (err) *err = "FAT: no data area"; return false; }
+    nextFree_ = 2;
+    cacheLba_ = -1;
 
     // Volume label: prefer a root VOL entry, else BPB ext label if present.
     volLabel_.clear();
@@ -373,6 +402,7 @@ bool Fat12::writeByteAt(long off, uint8_t value) {
 }
 
 void Fat12::setFatEntry(int cluster, int value) {
+    if (value == 0 && cluster < nextFree_) nextFree_ = cluster;
     for (int f = 0; f < nfat_; ++f) {
         long base = (fatStartSec_ + (long)f * spf_) * 512;
         if (fat16_) {
@@ -395,8 +425,12 @@ void Fat12::setFatEntry(int cluster, int value) {
 }
 
 int Fat12::allocCluster() {
-    for (int c = 2; c < totalClusters_ + 2; ++c)
-        if (fatEntry(c) == 0) return c;
+    // Search from the lowest cluster that may be free (setFatEntry lowers the
+    // hint when it frees one), so filling a large FAT16 volume stays linear.
+    if (nextFree_ < 2) nextFree_ = 2;
+    for (int c = nextFree_; c < totalClusters_ + 2; ++c)
+        if (fatEntry(c) == 0) { nextFree_ = c; return c; }
+    nextFree_ = totalClusters_ + 2;
     return -1;
 }
 
@@ -995,7 +1029,7 @@ Fat12::FsCheck Fat12::verify() const {
                 owner[idx] = 1; r.usedByFiles++; chainLen++;
                 int nxt = fatEntry(c);
                 if (nxt == 0) { r.issues.push_back(path + ": chain hits a free cluster"); broken = true; break; }
-                if (nxt == 1 || (nxt >= rsvMin_ && nxt <= bad_)) {
+                if (nxt == 1 || nxt == bad_ || (nxt >= totalClusters_ + 2 && nxt < eocMin_)) {
                     r.issues.push_back(path + ": chain hits a reserved/bad cluster marker"); broken = true; break;
                 }
                 c = nxt;

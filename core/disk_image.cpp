@@ -57,6 +57,7 @@ bool DiskImage::loadBytes(std::vector<uint8_t> bytes, const std::string& nameHin
                           std::string* err) {
     path_ = nameHint;
     format_ = DiskFormat::Unknown;
+    ++generation_;
     raw_ = std::move(bytes);
     sectors_.clear(); lba_.clear(); lbaSector_.clear();
     cylinders_ = heads_ = spt_ = 0; protectedFlags_ = false; dirty_ = false;
@@ -400,6 +401,7 @@ bool DiskImage::writeLogicalSector(long lba, const uint8_t in[512]) {
         if (sectors_[(size_t)lbaSector_[(size_t)lba]].markOffset < 0) return false;
     }
     memcpy(raw_.data() + off, in, 512);
+    ++generation_;
     // DMK: keep the data CRC valid, unless the sector carried a deliberate CRC
     // error (copy protection), which is preserved as found.
     if (format_ == DiskFormat::DMK && (size_t)lba < lbaSector_.size() && lbaSector_[(size_t)lba] >= 0) {
