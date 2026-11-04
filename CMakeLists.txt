@@ -19,6 +19,7 @@ target_link_libraries(msxforge PRIVATE msxcore)
 
 # --- dsk2dmk test tool ---
 add_executable(dsk2dmk tools/dsk2dmk.cpp)
+target_link_libraries(dsk2dmk PRIVATE msxcore)
 
 # --- tests (core library, no GUI deps): ctest --test-dir build ---
 option(MSXFF_BUILD_TESTS "Build the core test suite" ON)
