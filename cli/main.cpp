@@ -4,14 +4,8 @@
 // versions must be distributed under the same license.
 // MSXFileForge CLI - exercises the core library against real images.
 //
-//   msxforge info    <image>
-//   msxforge ls      <image> [/PATH] [--deleted]
-//   msxforge cat     <image> <FILE>        (raw bytes to stdout)
-//   msxforge detok   <image> <FILE.BAS>    (detokenize BASIC to stdout)
-//   msxforge extract <image> <FILE> <out>
-//   msxforge protect <image>               (protected/RAW sector inspector)
-//   msxforge rominfo <rom>
-//   msxforge cas     <cas>
+// Run without arguments for the full command list. Every <FILE> argument may
+// be a path into subdirectories ("GAMES/SAVE/SLOT1.DAT"), case-insensitive.
 #include "../core/disk_image.h"
 #include "../core/fat12.h"
 #include "../core/msxfile.h"
@@ -53,14 +47,11 @@ static int mountDisk(const char* path, DiskImage& dk, Fat12& fs) {
     return 0;
 }
 
-static const DirEntry* findEntry(const Fat12& fs, const std::string& name,
-                                 std::vector<DirEntry>& listing) {
-    std::string want = name; for (auto& c : want) c = (char)toupper((unsigned char)c);
-    for (auto& e : listing) {
-        std::string nm = e.name; for (auto& c : nm) c = (char)toupper((unsigned char)c);
-        if (nm == want) return &e;
-    }
-    return nullptr;
+// Resolve a FILE argument ("NAME.EXT", "/DIR/NAME.EXT" or "DIR\\NAME.EXT").
+static bool findEntry(const Fat12& fs, const std::string& name, DirEntry& out) {
+    std::string p = name;
+    if (p.empty() || (p[0] != '/' && p[0] != '\\')) p = "/" + p;
+    return fs.lookup(p, out);
 }
 
 static int cmd_info(const char* img) {
@@ -113,10 +104,9 @@ static int cmd_cat(int argc, char** argv, bool detok) {
     if (argc < 4) { fprintf(stderr, "need <image> <file>\n"); return 1; }
     DiskImage dk; Fat12 fs;
     int rc = mountDisk(argv[2], dk, fs); if (rc) return rc;
-    auto root = fs.list("/", false);
-    const DirEntry* e = findEntry(fs, argv[3], root);
-    if (!e) { fprintf(stderr, "file not found: %s\n", argv[3]); return 4; }
-    auto data = fs.readFile(*e);
+    DirEntry e;
+    if (!findEntry(fs, argv[3], e)) { fprintf(stderr, "file not found: %s\n", argv[3]); return 4; }
+    auto data = fs.readFile(e);
     if (detok) {
         std::string txt = detokenizeBasic(data);
         fwrite(txt.data(), 1, txt.size(), stdout);
@@ -131,10 +121,9 @@ static int cmd_extract(int argc, char** argv) {
     if (argc < 5) { fprintf(stderr, "need <image> <file> <out>\n"); return 1; }
     DiskImage dk; Fat12 fs;
     int rc = mountDisk(argv[2], dk, fs); if (rc) return rc;
-    auto root = fs.list("/", false);
-    const DirEntry* e = findEntry(fs, argv[3], root);
-    if (!e) { fprintf(stderr, "file not found: %s\n", argv[3]); return 4; }
-    auto data = fs.readFile(*e);
+    DirEntry e;
+    if (!findEntry(fs, argv[3], e)) { fprintf(stderr, "file not found: %s\n", argv[3]); return 4; }
+    auto data = fs.readFile(e);
     FILE* out = fopen(argv[4], "wb");
     if (!out) { fprintf(stderr, "cannot write %s\n", argv[4]); return 5; }
     fwrite(data.data(), 1, data.size(), out);
@@ -151,15 +140,16 @@ static int cmd_protect(const char* img) {
     if (dk.isProtected()) printf("%s\n", dk.protectionReport().c_str());
     int shown = 0, anomalies = 0;
     for (auto& s : dk.sectors()) {
-        bool odd = s.nonStandard || s.deleted || s.idCrcError || s.dataCrcError;
+        bool odd = s.nonStandard || s.deleted || s.idCrcError || s.dataCrcError || s.duplicateId;
         if (odd) anomalies++;
         if (odd && shown < 40) {
-            printf("  C%02d H%d S%02d size=%zu%s%s%s%s lba=%ld\n",
+            printf("  C%02d H%d S%02d size=%zu%s%s%s%s%s lba=%ld\n",
                    s.cyl, s.head, s.sec, s.size,
                    s.nonStandard ? " NONSTD" : "",
                    s.deleted ? " DELETED" : "",
                    s.idCrcError ? " IDCRC" : "",
-                   s.dataCrcError ? " DATACRC" : "", s.lba);
+                   s.dataCrcError ? " DATACRC" : "",
+                   s.duplicateId ? " DUPID" : "", s.lba);
             shown++;
         }
     }
@@ -172,14 +162,9 @@ static int cmd_put(int argc, char** argv) {
     if (argc < 5) { fprintf(stderr, "need <image> <FILE> <hostfile> [outimage]\n"); return 1; }
     DiskImage dk; Fat12 fs;
     int rc = mountDisk(argv[2], dk, fs); if (rc) return rc;
-    auto root = fs.list("/", false);
-    DirEntry* e = nullptr;
-    std::string want = argv[3]; for (auto& c : want) c = (char)toupper((unsigned char)c);
-    for (auto& d : root) {
-        std::string nm = d.name; for (auto& c : nm) c = (char)toupper((unsigned char)c);
-        if (nm == want) { e = &d; break; }
-    }
-    if (!e) { fprintf(stderr, "file not found: %s\n", argv[3]); return 4; }
+    DirEntry ent;
+    if (!findEntry(fs, argv[3], ent)) { fprintf(stderr, "file not found: %s\n", argv[3]); return 4; }
+    DirEntry* e = &ent;
     auto data = slurp(argv[4]);
     std::string err;
     if (!fs.writeFile(*e, data, &err)) { fprintf(stderr, "write: %s\n", err.c_str()); return 6; }
@@ -194,11 +179,11 @@ static int cmd_del(int argc, char** argv) {
     if (argc < 4) { fprintf(stderr, "need <image> <FILE> [outimage]\n"); return 1; }
     DiskImage dk; Fat12 fs;
     int rc = mountDisk(argv[2], dk, fs); if (rc) return rc;
-    auto root = fs.list("/", false);
-    const DirEntry* e = findEntry(fs, argv[3], root);
-    if (!e) { fprintf(stderr, "file not found: %s\n", argv[3]); return 4; }
+    DirEntry e;
+    if (!findEntry(fs, argv[3], e)) { fprintf(stderr, "file not found: %s\n", argv[3]); return 4; }
     std::string err;
-    if (!fs.deleteFile(*e, &err)) { fprintf(stderr, "delete: %s\n", err.c_str()); return 6; }
+    bool ok = e.isDir() ? fs.removeDir(e, &err) : fs.deleteFile(e, &err);
+    if (!ok) { fprintf(stderr, "delete: %s\n", err.c_str()); return 6; }
     const char* out = (argc >= 5) ? argv[4] : argv[2];
     if (!dk.save(out, &err)) { fprintf(stderr, "save: %s\n", err.c_str()); return 7; }
     printf("deleted %s -> %s\n", argv[3], out);
@@ -313,15 +298,11 @@ static int cmd_add(int argc, char** argv) {
 static int cmd_rename(int argc, char** argv) {
     if (argc < 5) { fprintf(stderr, "need <image> <OLD> <NEW>\n"); return 1; }
     DiskImage dk; Fat12 fs; int rc = mountDisk(argv[2], dk, fs); if (rc) return rc;
-    auto root = fs.list("/", false);
-    DirEntry* e = nullptr;
-    std::string want = argv[3]; for (auto& c : want) c = (char)toupper((unsigned char)c);
-    for (auto& d : root) { std::string nm=d.name; for(auto&c:nm)c=(char)toupper((unsigned char)c);
-        if (nm==want){e=&d;break;} }
-    if (!e) { fprintf(stderr, "not found\n"); return 4; }
+    DirEntry e;
+    if (!findEntry(fs, argv[3], e)) { fprintf(stderr, "not found: %s\n", argv[3]); return 4; }
     std::string err;
-    if (!fs.renameEntry(*e, argv[4], &err)) { fprintf(stderr, "rename: %s\n", err.c_str()); return 6; }
-    if (!dk.save(argv[2], &err)) return 7;
+    if (!fs.renameEntry(e, argv[4], &err)) { fprintf(stderr, "rename: %s\n", err.c_str()); return 6; }
+    if (!dk.save(argv[2], &err)) { fprintf(stderr, "save: %s\n", err.c_str()); return 7; }
     printf("renamed %s -> %s\n", argv[3], argv[4]); return 0;
 }
 
@@ -331,7 +312,7 @@ static int cmd_mkdir(int argc, char** argv) {
     std::string parent = (argc >= 5) ? argv[4] : "/";
     std::string err;
     if (!fs.makeDir(parent, argv[3], &err)) { fprintf(stderr, "mkdir: %s\n", err.c_str()); return 6; }
-    if (!dk.save(argv[2], &err)) return 7;
+    if (!dk.save(argv[2], &err)) { fprintf(stderr, "save: %s\n", err.c_str()); return 7; }
     printf("created dir %s in %s\n", argv[3], parent.c_str()); return 0;
 }
 
@@ -339,10 +320,9 @@ static int cmd_crc(int argc, char** argv) {
     if (argc < 3) { fprintf(stderr, "need <image> [FILE]\n"); return 1; }
     if (argc >= 4) {
         DiskImage dk; Fat12 fs; int rc = mountDisk(argv[2], dk, fs); if (rc) return rc;
-        auto root = fs.list("/", false);
-        const DirEntry* e = findEntry(fs, argv[3], root);
-        if (!e) { fprintf(stderr, "not found\n"); return 4; }
-        auto d = fs.readFile(*e);
+        DirEntry e;
+        if (!findEntry(fs, argv[3], e)) { fprintf(stderr, "not found: %s\n", argv[3]); return 4; }
+        auto d = fs.readFile(e);
         printf("%08X  %s  (%zu bytes)\n", crc32(d), argv[3], d.size());
     } else {
         auto d = slurp(argv[2]);
@@ -364,26 +344,42 @@ static int cmd_fsck(const char* img) {
     return c.issues.empty() ? 0 : 1;
 }
 
+// Every file on the disk as "/DIR/NAME" -> entry (directories walked).
+static void allFiles(const Fat12& fs, const std::string& dir,
+                     std::vector<std::pair<std::string, DirEntry>>& out, int depth = 0) {
+    if (depth > 16) return;   // corrupt trees can loop
+    for (auto& e : fs.list(dir, false)) {
+        if (e.isVolume() || e.name == "." || e.name == "..") continue;
+        std::string p = (dir == "/" ? "" : dir) + "/" + e.name;
+        if (e.isDir()) allFiles(fs, p, out, depth + 1);
+        else out.push_back({p, e});
+    }
+}
+
 static int cmd_diff(int argc, char** argv) {
     if (argc < 4) { fprintf(stderr, "need <imageA> <imageB>\n"); return 1; }
     DiskImage a, b; Fat12 fa, fb; int rc;
     if ((rc = mountDisk(argv[2], a, fa))) return rc;
     if ((rc = mountDisk(argv[3], b, fb))) return rc;
-    auto la = fa.list("/", false), lb = fb.list("/", false);
-    auto findIn = [](std::vector<DirEntry>& l, const std::string& n) -> DirEntry* {
-        for (auto& e : l) if (e.name == n && !e.isDir()) return &e; return nullptr; };
+    std::vector<std::pair<std::string, DirEntry>> la, lb;
+    allFiles(fa, "/", la); allFiles(fb, "/", lb);
+    auto findIn = [](std::vector<std::pair<std::string, DirEntry>>& l, const std::string& n) -> DirEntry* {
+        for (auto& e : l) if (e.first == n) return &e.second;
+        return nullptr;
+    };
     printf("--- %s  vs  +++ %s\n", baseName(argv[2]).c_str(), baseName(argv[3]).c_str());
-    int same=0, diff=0, onlyA=0, onlyB=0;
-    for (auto& e : la) { if (e.isDir()||e.isVolume()) continue;
-        DirEntry* o = findIn(lb, e.name);
-        if (!o) { printf("  - only in A: %s\n", e.name.c_str()); onlyA++; }
-        else { uint32_t ca=crc32(fa.readFile(e)), cb=crc32(fb.readFile(*o));
-            if (ca!=cb) { printf("  * differs : %s (%08X vs %08X)\n", e.name.c_str(), ca, cb); diff++; }
-            else same++; } }
-    for (auto& e : lb) { if (e.isDir()||e.isVolume()) continue;
-        if (!findIn(la, e.name)) { printf("  + only in B: %s\n", e.name.c_str()); onlyB++; } }
+    int same = 0, diff = 0, onlyA = 0, onlyB = 0;
+    for (auto& e : la) {
+        DirEntry* o = findIn(lb, e.first);
+        if (!o) { printf("  - only in A: %s\n", e.first.c_str()); onlyA++; continue; }
+        uint32_t ca = crc32(fa.readFile(e.second)), cb = crc32(fb.readFile(*o));
+        if (ca != cb) { printf("  * differs : %s (%08X vs %08X)\n", e.first.c_str(), ca, cb); diff++; }
+        else same++;
+    }
+    for (auto& e : lb)
+        if (!findIn(la, e.first)) { printf("  + only in B: %s\n", e.first.c_str()); onlyB++; }
     printf("summary: %d same, %d differ, %d only-A, %d only-B\n", same, diff, onlyA, onlyB);
-    return 0;
+    return (diff || onlyA || onlyB) ? 1 : 0;
 }
 
 static int cmd_tape(int argc, char** argv, const char* mode) {
@@ -434,9 +430,34 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr,
             "MSXFileForge CLI\n"
-            "usage: msxforge <cmd> <file> [args]\n"
-            "  info|ls|cat|detok|extract|protect  <disk-image>\n"
-            "  rominfo <rom>   cas <cas>\n");
+            "usage: msxforge <cmd> <file> [args]   (FILE may be a path: DIR/NAME.EXT)\n"
+            "\n"
+            "disk images (.dsk / .dmk):\n"
+            "  info    <img>                       geometry, filesystem, free space\n"
+            "  ls      <img> [/PATH] [--deleted]   list a directory\n"
+            "  cat     <img> <FILE>                raw file bytes to stdout\n"
+            "  detok   <img> <FILE>                tokenized BASIC as text\n"
+            "  extract <img> <FILE> <out>          copy a file to the host\n"
+            "  add     <img> <hostfile> [/DIR] [NAME]  add a new file\n"
+            "  put     <img> <FILE> <hostfile> [outimg] overwrite a file\n"
+            "  del     <img> <FILE|DIR> [outimg]   delete a file or an empty directory\n"
+            "  rename  <img> <FILE> <NEWNAME>      rename in place\n"
+            "  mkdir   <img> <NAME> [/PARENT]      create a directory\n"
+            "  format  <out.dsk> [360|720]         blank MSX-DOS disk\n"
+            "  fsck    <img>                       FAT integrity check\n"
+            "  diff    <imgA> <imgB>               compare all files by CRC\n"
+            "  crc     <img|file> [FILE]           CRC32 of an image or a file in it\n"
+            "  protect <img>                       copy-protection / sector inspector\n"
+            "  raw     <img> [out.bin]             cluster map, dump RAW unnamed data\n"
+            "  rawput  <img> <hostfile> [outimg]   write RAW unnamed data back\n"
+            "  carve   <img>                       split RAW data into BLOAD/BASIC blocks\n"
+            "\n"
+            "other files:\n"
+            "  tok     <text.bas> [out.bas]        tokenize an ASCII listing\n"
+            "  rominfo <rom>                       header + mapper guess\n"
+            "  cas     <cas>                       cassette block list\n"
+            "  cas2wav|cas2tsx <in> <out> [-2]     encode tape (-2 = 2400 baud)\n"
+            "  wav2cas|tsx2cas <in> <out>          decode tape\n");
         return 1;
     }
     std::string cmd = argv[1];
