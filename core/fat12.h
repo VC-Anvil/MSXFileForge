@@ -40,7 +40,16 @@ public:
     // Mount the filesystem. Returns false if the boot sector / BPB is not FAT12.
     // Takes a non-const image so files can be written back in place.
     bool mount(DiskImage& disk, std::string* err = nullptr);
+    // Mount a volume that starts at `firstSector` of the image (a partition of
+    // a hard disk / SD card image). `sectorCount` caps the volume (0 = to the
+    // end of the image).
+    bool mount(DiskImage& disk, long firstSector, long sectorCount, std::string* err = nullptr);
     bool mounted() const { return mounted_; }
+
+    // 12 or 16. FAT12 below 4085 clusters, FAT16 from there (as in MS-DOS).
+    int fatBits() const { return fat16_ ? 16 : 12; }
+    // First sector of the mounted volume inside the image (0 for floppies).
+    long volumeStart() const { return partBase_; }
 
     // BPB-derived facts.
     int bytesPerSector() const { return bps_; }
@@ -174,7 +183,8 @@ private:
     std::vector<DirEntry> readDirAtCluster(int cluster, bool includeDeleted) const;
     std::vector<DirEntry> readRootDir(bool includeDeleted) const;
     int fatEntry(int cluster) const;
-    bool sectorBytes(long lba, uint8_t out[512]) const;
+    bool sectorBytes(long lba, uint8_t out[512]) const;   // volume-relative read
+    bool putSector(long lba, const uint8_t in[512]);       // volume-relative write
     static std::vector<DirEntry> parseEntries(const std::vector<uint8_t>& buf,
                                               long baseOffset, bool includeDeleted,
                                               bool* ended = nullptr);
@@ -183,6 +193,9 @@ private:
     bool mounted_ = false;
     int bps_ = 512, spc_ = 2, rsvd_ = 1, nfat_ = 2, ndir_ = 112;
     int totalSectors_ = 0, spf_ = 3, totalClusters_ = 0;
+    bool fat16_ = false;
+    int eoc_ = 0xFFF, eocMin_ = 0xFF8, bad_ = 0xFF7, rsvMin_ = 0xFF0; // per FAT width
+    long partBase_ = 0, partLimit_ = 0;
     uint8_t media_ = 0;
     long fatStartSec_ = 0, rootStartSec_ = 0, dataStartSec_ = 0;
     int rootSectors_ = 0;

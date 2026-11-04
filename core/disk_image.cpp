@@ -138,6 +138,9 @@ bool DiskImage::parsePlain(std::string* err) {
     const uint8_t* b = raw_.data();
     bool bootish = (b[0] == 0xEB || b[0] == 0xE9) && rd16(b + 0x0B) == 512;
     format_ = bootish ? DiskFormat::DSK_Plain : DiskFormat::RAW;
+    // Anything well beyond floppy sizes is a hard disk / SD card image
+    // (partitioned, or a single "superfloppy" FAT volume).
+    if (raw_.size() > 2L * 1024 * 1024) format_ = DiskFormat::HDD;
     return true;
 }
 
