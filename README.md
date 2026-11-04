@@ -81,7 +81,30 @@ to interested packagers.
 
 All targets produce `msxforge` (CLI), `msxforge-gui` (GUI) and `dsk2dmk`.
 
+**Headless (no SDL2/OpenGL)** — build only the core, the CLI and the tests:
+
+```sh
+cmake -B build -DMSXFF_BUILD_GUI=OFF && cmake --build build -j
+```
+
+## Tests
+
+`ctest --test-dir build --output-on-failure` runs two suites (CI runs them on
+Linux, macOS arm64 and Windows):
+
+- **core** (`tests/test_*.cpp`, no external framework): FAT12 create / overwrite
+  / delete / rename / mkdir / rmdir, disk-full rollback, 8.3 validation, fsck on
+  corrupted trees; the BASIC tokenizer byte-for-byte (constants, line numbers,
+  `DATA`, `REM`/`'`, `ELSE`) and detokenize → tokenize round trips; DMK CRCs,
+  deleted marks, duplicate IDs and odd tracks; ROM mapper detection; CAS ↔ WAV
+  and CAS ↔ TSX round trips. `build/tests/msxff_tests <name>` runs a subset.
+- **cli_smoke** (`tests/cli_smoke.cmake`): drives the `msxforge` binary end to
+  end on a freshly formatted disk.
+
 ## CLI usage
+
+Every `<FILE>` may be a path into subdirectories (`GAMES/SAVE/SLOT1.DAT`),
+case-insensitive. Run `msxforge` without arguments for this list.
 
 ```
 msxforge info    <image>              disk/format/geometry/FAT summary
@@ -91,7 +114,7 @@ msxforge detok   <image> <FILE.BAS>   detokenize BASIC to stdout
 msxforge tok     <text> [out.bas]     tokenize text BASIC (round-trip check)
 msxforge extract <image> <FILE> <out>
 msxforge put     <image> <FILE> <hostfile> [outimage]   overwrite a file
-msxforge del     <image> <FILE> [outimage]              delete a file
+msxforge del     <image> <FILE|DIR> [outimage]          delete a file or an empty directory
 msxforge protect <image>              physical sector / protection inspector
 msxforge raw     <image> [out.bin]    cluster map (named/RAW/free) + extract RAW data
 msxforge carve   <image>              split the RAW region into BLOAD/BASIC/gap blocks
@@ -102,7 +125,7 @@ msxforge rename  <image> <OLD> <NEW>
 msxforge mkdir   <image> <NAME> [/PARENT]
 msxforge crc     <image> [FILE]       CRC32 of a file or the whole image
 msxforge fsck    <image>              filesystem integrity check
-msxforge diff    <imageA> <imageB>    compare two disks
+msxforge diff    <imageA> <imageB>    compare all files of two disks (exit 1 if they differ)
 msxforge cas2wav <in.cas> <out.wav> [-2]   render tape to WAV (-2 = 2400 baud)
 msxforge cas2tsx <in.cas> <out.tsx> [-2]   convert to TSX (TZX + MSX 0x4B KCS)
 msxforge tsx2cas <in.tsx> <out.cas>        extract tape data from TSX
@@ -147,15 +170,18 @@ detokenize, and delete frees clusters and drops the entry.
 
 ## Honest limitations
 
-- DMK **CRC verification** is not yet performed (CRC fields are parsed but not
-  recomputed); anomaly flags (non-standard size, deleted marks, geometry
-  mismatch) are exercised by construction, not yet against a commercial
-  copy-protected dump.
-- BASIC **BCD floats** are decoded/encoded numerically — correct in value but not
-  guaranteed byte-identical to the ROM lister's exact rounding.
-- Creating brand-new files / renaming (as opposed to overwrite/delete) and
-  writing back into a `.dmk` container are the next milestones (disk writes
-  target flat `.dsk`/raw today).
+- DMK ID/data **CRCs are verified** (and recomputed when a sector is written),
+  and duplicate IDs / deleted marks are flagged, but this has been exercised on
+  constructed images (`tests/test_disk.cpp`), not yet on a library of
+  commercial copy-protected dumps. Single-density (FM) DMK tracks are parsed but
+  not specifically tested.
+- BASIC constants are converted exactly through their decimal digits. When a
+  listing is produced, single-precision constants carry a `!` and integral
+  double-precision constants that would otherwise read back as integers carry a
+  `#`, so detokenize → tokenize reproduces the bytes; the real MSX `LIST` may
+  print some of these without the suffix.
+- Directories are created, grown and removed; the root directory keeps its fixed
+  size (112 entries on standard disks), as on MSX-DOS.
 
 ## License
 
