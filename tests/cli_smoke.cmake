@@ -107,4 +107,23 @@ run(0 "${MSXFORGE}" fsck "${WORK}/p.dsk")
 run(0 "${MSXFORGE}" label "${WORK}/p.dsk" --clear)
 expect_in("removed")
 
+# ---- hard disk images: FAT16, partitions ------------------------------------
+run(0 "${MSXFORGE}" mkhdd "${WORK}/h.img" 8M,4M,2M,3M,2M)
+run(0 "${MSXFORGE}" info "${WORK}/h.img")
+expect_in("Partitions : 5")
+expect_in("FAT16")
+run(0 "${MSXFORGE}" add "${WORK}/h.img" "${WORK}/notes.txt" / ONE.TXT)          # partition 1
+run(0 "${MSXFORGE}" add "${WORK}/h.img" "${WORK}/notes.txt" / FOUR.TXT --part 4)
+run(0 "${MSXFORGE}" ls "${WORK}/h.img" --part 4)
+expect_in("FOUR.TXT")
+run(0 "${MSXFORGE}" ls "${WORK}/h.img" --part 1)
+expect_in("ONE.TXT")
+run(4 "${MSXFORGE}" cat "${WORK}/h.img" FOUR.TXT --part 1)
+run(3 "${MSXFORGE}" ls "${WORK}/h.img" --part 9)
+run(0 "${MSXFORGE}" fsck "${WORK}/h.img" --part 4)
+run(0 "${MSXFORGE}" format "${WORK}/sd.img" 40M NEXTOR)
+run(0 "${MSXFORGE}" info "${WORK}/sd.img")
+expect_in("FAT16")
+expect_in("NEXTOR")
+
 message(STATUS "cli smoke test passed")

@@ -22,6 +22,7 @@ It handles the whole MSX file stack:
 |--------|--------------|
 | **Disk images** | `.dsk` / raw sector dumps, and `.dmk` track images (protected disks). Auto-detects geometry (SS/DS, 360/720 KB). |
 | **Protected / RAW** | A `.dmk` preserves the physical IDAM/sector layout, so copy-protected disks survive: non-standard sector sizes, deleted-data address marks, duplicate IDs and CRC anomalies are surfaced in a **sector inspector**. Many games (Fray, Xak, ...) show only 1-2 catalogued files while the rest of the disk is **RAW uncatalogued sector data** read directly by a custom loader (not encryption); a **cluster map + RAW extractor/importer + block carver** makes that data visible, exportable, editable-and-reimportable, and splittable into BLOAD/BASIC segments. |
+| **Hard disks / SD cards** | MSX-DOS 2 / Nextor images: **FAT16** (and FAT12) volumes, **MBR partition tables with extended/logical drives**, superfloppy images; pick a partition with `--part N` (CLI) or the Partition selector (GUI). Create them with `mkhdd` / `format <out> 32M`. FAT32 is reported as unsupported. |
 | **FAT12 filesystem** | MSX-DOS disks: boot/BPB, FAT chains, root + subdirectories, volume label, free space, extraction, **deleted-entry recovery**, and full **read/write** — overwrite / grow / shrink / **add new files** / **rename** / **create folders** / delete (automatic cluster (re)allocation across both FAT copies), plus **format a blank disk** from scratch. |
 | **Analysis / integrity** | CRC32 of files and images, a **filesystem check** (cross-links, broken chains, lost vs RAW clusters), and a **disk diff** (files only-in-A / only-in-B / differing by CRC). Optional `.bak` backup on save. |
 | **MSX files** | Type detection (tokenized BASIC `0xFF`, BLOAD binary `0xFE`, ASCII, data), a full **BASIC detokenizer** and an inverse **tokenizer** (edit a listing as text and save it back tokenized). Handles standard + `0xFF`-extended tokens, hex/oct/int/BCD-float constants, line references, string & REM literals. |
@@ -104,7 +105,9 @@ Linux, macOS arm64 and Windows):
 ## CLI usage
 
 Every `<FILE>` may be a path into subdirectories (`GAMES/SAVE/SLOT1.DAT`),
-case-insensitive. Run `msxforge` without arguments for this list.
+case-insensitive. On a partitioned hard disk image, add `--part N` to any disk
+command (default: the first FAT partition); `info` lists the partitions. Run
+`msxforge` without arguments for this list.
 
 ```
 msxforge info    <image>              disk/format/geometry/FAT summary
@@ -119,7 +122,8 @@ msxforge protect <image>              physical sector / protection inspector
 msxforge raw     <image> [out.bin]    cluster map (named/RAW/free) + extract RAW data
 msxforge carve   <image>              split the RAW region into BLOAD/BASIC/gap blocks
 msxforge rawput  <image> <hostfile> [outimage]   write RAW data back into the image
-msxforge format  <out.dsk> [360|720]  create a blank formatted disk
+msxforge format  <out> [360|720|<N>M] [LABEL]   blank floppy, or a FAT16 superfloppy of N MB
+msxforge mkhdd   <out.img> <N>M[,<N>M...]       partitioned hard disk / SD image (FAT12/16)
 msxforge pack    <hostdir> <out.dsk> [360|720] [--label L]  build a disk from a folder tree
 msxforge unpack  <image> <hostdir>    extract the whole tree to a folder
 msxforge undelete <image> <[DIR/]?NAME> [LETTER] [outimage]  recover a deleted file
@@ -186,6 +190,10 @@ detokenize, and delete frees clusters and drops the entry.
   double-precision constants that would otherwise read back as integers carry a
   `#`, so detokenize → tokenize reproduces the bytes; the real MSX `LIST` may
   print some of these without the suffix.
+- Hard disk support is verified on images built by `mkhdd`/`format` (tests and
+  the GUI), not yet on SD cards partitioned by Nextor's own FDISK. Images are
+  read fully into memory; on Windows, image byte offsets are 32-bit, so keep
+  images below 2 GB there (`format`/`mkhdd` create at most 2047 MB).
 - Directories are created, grown and removed; the root directory keeps its fixed
   size (112 entries on standard disks), as on MSX-DOS.
 
