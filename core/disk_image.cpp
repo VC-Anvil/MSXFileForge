@@ -57,6 +57,7 @@ bool DiskImage::loadBytes(std::vector<uint8_t> bytes, const std::string& nameHin
                           std::string* err) {
     path_ = nameHint;
     format_ = DiskFormat::Unknown;
+    ++generation_;
     raw_ = std::move(bytes);
     sectors_.clear(); lba_.clear(); lbaSector_.clear();
     cylinders_ = heads_ = spt_ = 0; protectedFlags_ = false; dirty_ = false;
@@ -138,6 +139,9 @@ bool DiskImage::parsePlain(std::string* err) {
     const uint8_t* b = raw_.data();
     bool bootish = (b[0] == 0xEB || b[0] == 0xE9) && rd16(b + 0x0B) == 512;
     format_ = bootish ? DiskFormat::DSK_Plain : DiskFormat::RAW;
+    // Anything well beyond floppy sizes is a hard disk / SD card image
+    // (partitioned, or a single "superfloppy" FAT volume).
+    if (raw_.size() > 2L * 1024 * 1024) format_ = DiskFormat::HDD;
     return true;
 }
 
@@ -397,6 +401,7 @@ bool DiskImage::writeLogicalSector(long lba, const uint8_t in[512]) {
         if (sectors_[(size_t)lbaSector_[(size_t)lba]].markOffset < 0) return false;
     }
     memcpy(raw_.data() + off, in, 512);
+    ++generation_;
     // DMK: keep the data CRC valid, unless the sector carried a deliberate CRC
     // error (copy protection), which is preserved as found.
     if (format_ == DiskFormat::DMK && (size_t)lba < lbaSector_.size() && lbaSector_[(size_t)lba] >= 0) {

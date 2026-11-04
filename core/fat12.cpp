@@ -3,6 +3,7 @@
 // Free software under the GNU GPL v3 (or later) - see LICENSE. Modified
 // versions must be distributed under the same license.
 #include "fat12.h"
+#include <algorithm>
 #include <cstring>
 #include <cstdio>
 #include <sstream>
@@ -53,8 +54,23 @@ std::string DirEntry::attrString() const {
     return a;
 }
 
+// One-sector read cache: FAT scans read the same sector hundreds of times in
+// a row. Writes go through putSector(), which keeps it coherent.
 bool Fat12::sectorBytes(long lba, uint8_t out[512]) const {
-    return disk_ && disk_->readSector(lba, out);
+    if (!disk_ || lba < 0 || (partLimit_ > 0 && lba >= partLimit_)) return false;
+    if (lba == cacheLba_ && cacheDisk_ == disk_ && cacheGen_ == disk_->generation()) {
+        memcpy(out, cache_, 512); return true;
+    }
+    if (!disk_->readSector(partBase_ + lba, out)) return false;
+    memcpy(cache_, out, 512); cacheLba_ = lba; cacheDisk_ = disk_; cacheGen_ = disk_->generation();
+    return true;
+}
+
+bool Fat12::putSector(long lba, const uint8_t in[512]) {
+    if (!disk_ || lba < 0 || (partLimit_ > 0 && lba >= partLimit_)) return false;
+    if (!disk_->writeLogicalSector(partBase_ + lba, in)) return false;
+    if (lba == cacheLba_ && cacheDisk_ == disk_) { memcpy(cache_, in, 512); cacheGen_ = disk_->generation(); }
+    return true;
 }
 
 // Standard MSX/PC floppy geometries, keyed by the media descriptor byte that
@@ -92,8 +108,17 @@ bool Fat12::mountFromMediaByte(std::string* err) {
 }
 
 bool Fat12::mount(DiskImage& disk, std::string* err) {
+    return mount(disk, 0, 0, err);
+}
+
+bool Fat12::mount(DiskImage& disk, long firstSector, long sectorCount, std::string* err) {
     disk_ = &disk;
     mounted_ = false;
+    cacheLba_ = -1;
+    partBase_ = firstSector < 0 ? 0 : firstSector;
+    long avail = disk.logicalSectors() - partBase_;
+    partLimit_ = (sectorCount > 0 && sectorCount < avail) ? sectorCount : 0;
+    long volSectors = partLimit_ > 0 ? partLimit_ : avail;
     uint8_t b[512];
     if (!sectorBytes(0, b)) { if (err) *err = "cannot read boot sector"; return false; }
 
@@ -102,62 +127,105 @@ bool Fat12::mount(DiskImage& disk, std::string* err) {
     rsvd_ = rd16(b + 0x0E);
     nfat_ = b[0x10];
     ndir_ = rd16(b + 0x11);
-    totalSectors_ = rd16(b + 0x13);
+    long total = rd16(b + 0x13);
+    // The 32-bit count at 0x20 exists only in DOS 3.31+ BPBs; on MSX-DOS 1
+    // boot sectors those bytes are boot code. Trust it only with an extended
+    // boot signature, or for a large volume the image can actually hold.
+    uint32_t total32 = (uint32_t)(b[0x20] | (b[0x21] << 8) | (b[0x22] << 16) | ((uint32_t)b[0x23] << 24));
+    if (total == 0 && total32 <= 0x7FFFFFFF &&
+        (b[0x26] == 0x28 || b[0x26] == 0x29 || (total32 > 65535 && (long)total32 <= volSectors)))
+        total = (long)total32;
     media_ = b[0x15];
     spf_  = rd16(b + 0x16);
     oem_  = trim(std::string((const char*)b + 3, 8));
 
-    bool bpbOk = bps_ == 512 && isPow2(spc_) && spc_ <= 64 && nfat_ >= 1 && nfat_ <= 4 &&
+    bool bpbOk = bps_ == 512 && isPow2(spc_) && spc_ <= 128 && nfat_ >= 1 && nfat_ <= 4 &&
                  ndir_ > 0 && ndir_ % 16 == 0 && spf_ > 0 && rsvd_ > 0;
-    if (bpbOk && totalSectors_ == 0) totalSectors_ = (int)disk.logicalSectors();
+    if (bpbOk && total == 0) total = volSectors;
     if (bpbOk) {
-        long data = (long)totalSectors_ - rsvd_ - (long)nfat_ * spf_ - (ndir_ * 32 + 511) / 512;
+        long data = total - rsvd_ - (long)nfat_ * spf_ - (ndir_ * 32 + 511) / 512;
         bpbOk = data >= spc_;
     }
-    if (!bpbOk) {
+    if (bpbOk) totalSectors_ = (int)std::min<long>(total, 0x7FFFFFFF);
+    else {
         oem_.clear();
-        if (!mountFromMediaByte(err)) return false;
+        // Only floppies come without a BPB; a partition always has one.
+        std::string mErr;
+        // (The media-byte table only describes floppies up to 1.44MB.)
+        if (partBase_ != 0 || volSectors > 2 * 2880 || !mountFromMediaByte(&mErr)) {
+            bool fat32 = bps_ == 512 && spf_ == 0 && ndir_ == 0 && isPow2(spc_) &&
+                         nfat_ >= 1 && nfat_ <= 2 && rsvd_ > 0 && rd32(b + 0x24) > 0;
+            if (err) *err = fat32 ? "FAT32 volumes are not supported (MSX-DOS / Nextor use FAT12 and FAT16)"
+                                  : (mErr.empty() ? "not a FAT boot sector" : mErr);
+            return false;
+        }
     }
-
-    // Never address sectors the container does not have (a truncated image, or
-    // a media-byte guess larger than the dump). DMK images may legitimately
-    // end in unreadable holes, so their logical size is not a cap.
-    if (disk.format() != DiskFormat::DMK && totalSectors_ > disk.logicalSectors())
-        totalSectors_ = (int)disk.logicalSectors();
 
     fatStartSec_  = rsvd_;
     rootStartSec_ = rsvd_ + (long)nfat_ * spf_;
     rootSectors_  = (ndir_ * 32 + bps_ - 1) / bps_;
     dataStartSec_ = rootStartSec_ + rootSectors_;
-    long dataSectors = totalSectors_ - dataStartSec_;
-    totalClusters_ = spc_ > 0 ? (int)(dataSectors / spc_) : 0;
-    // A FAT12 entry is 1.5 bytes: never address clusters the FAT cannot hold.
-    int fatCapacity = (int)((long)spf_ * 512 * 2 / 3) - 2;
-    if (totalClusters_ > fatCapacity) totalClusters_ = fatCapacity;
-    if (totalClusters_ > 4084) totalClusters_ = 4084;
-    if (totalClusters_ < 1) { if (err) *err = "FAT12: no data area"; return false; }
+
+    // The FAT type follows from the cluster count the BPB describes
+    // (Microsoft's rule), BEFORE any clamping to what the container holds: a
+    // truncated FAT16 image is still FAT16. A DMK is a floppy: its geometry
+    // bounds the count.
+    long typeSectors = totalSectors_;
+    if (disk.format() == DiskFormat::DMK) {
+        long geo = (long)disk.cylinders() * disk.heads() * disk.sectorsPerTrack();
+        if (geo > 0 && typeSectors > geo) typeSectors = geo;
+    }
+    long bpbClusters = spc_ > 0 ? (typeSectors - dataStartSec_) / spc_ : 0;
+    fat16_ = bpbClusters >= 4085;
+    if (fat16_) { eoc_ = 0xFFFF; eocMin_ = 0xFFF8; bad_ = 0xFFF7; rsvMin_ = 0xFFF0; }
+    else        { eoc_ = 0xFFF;  eocMin_ = 0xFF8;  bad_ = 0xFF7;  rsvMin_ = 0xFF0; }
+
+    // Never address sectors the container does not have (a truncated image, or
+    // a media-byte guess larger than the dump). DMK images may legitimately
+    // end in unreadable holes, so their logical size is not a cap.
+    if (disk.format() != DiskFormat::DMK && totalSectors_ > volSectors)
+        totalSectors_ = (int)volSectors;
+    long clusters = spc_ > 0 ? (totalSectors_ - dataStartSec_) / spc_ : 0;
+    if (clusters > bpbClusters) clusters = bpbClusters;
+    if (clusters > 65524) clusters = 65524;
+    // Never address clusters the FAT cannot hold (1.5 or 2 bytes per entry).
+    long fatCapacity = fat16_ ? (long)spf_ * 512 / 2 - 2 : (long)spf_ * 512 * 2 / 3 - 2;
+    if (clusters > fatCapacity) clusters = fatCapacity;
+    totalClusters_ = (int)clusters;
+    if (totalClusters_ < 1) { if (err) *err = "FAT: no data area"; return false; }
+    nextFree_ = 2;
+    cacheLba_ = -1;
 
     // Volume label: prefer a root VOL entry, else BPB ext label if present.
     volLabel_.clear();
     for (auto& e : readRootDir(false)) {
         if (e.isVolume()) { volLabel_ = e.name; break; }
     }
-    if (volLabel_.empty() && bpbOk && b[0x26] == 0x29) // extended boot sig
-        volLabel_ = trim(std::string((const char*)b + 0x2B, 11));
+    if (volLabel_.empty() && bpbOk && b[0x26] == 0x29) { // extended boot sig
+        std::string l = trim(std::string((const char*)b + 0x2B, 11));
+        if (l != "NO NAME") volLabel_ = l;
+    }
 
     mounted_ = true;
     return true;
 }
 
 int Fat12::fatEntry(int cluster) const {
+    if (fat16_) {
+        long fatByte = fatStartSec_ * 512 + (long)cluster * 2;
+        uint8_t s0[512];
+        if (!sectorBytes(fatByte / 512, s0)) return eoc_;
+        int off = (int)(fatByte % 512);
+        return s0[off] | (s0[off + 1] << 8);
+    }
     long fatByte = fatStartSec_ * 512 + (cluster + cluster / 2);
     long sec = fatByte / 512;
     int off = (int)(fatByte % 512);
     uint8_t s0[512], s1[512];
-    if (!sectorBytes(sec, s0)) return 0xFFF;
+    if (!sectorBytes(sec, s0)) return eoc_;
     uint8_t lo = s0[off];
     uint8_t hi;
-    if (off == 511) { if (!sectorBytes(sec + 1, s1)) return 0xFFF; hi = s1[0]; }
+    if (off == 511) { if (!sectorBytes(sec + 1, s1)) return eoc_; hi = s1[0]; }
     else hi = s0[off + 1];
     uint16_t v = (uint16_t)(lo | (hi << 8));
     return (cluster & 1) ? (v >> 4) & 0xFFF : v & 0xFFF;
@@ -291,7 +359,7 @@ std::vector<uint8_t> Fat12::readFile(const DirEntry& e) const {
     long remaining = e.size;
     long clusterBytes = (long)spc_ * 512;
     int guard = 0;
-    while (remaining > 0 && cluster >= 2 && cluster < 0xFF8 &&
+    while (remaining > 0 && cluster >= 2 && cluster < eocMin_ &&
            guard++ < totalClusters_ + 8) {
         long firstSec = dataStartSec_ + (long)(cluster - 2) * spc_;
         for (int s = 0; s < spc_ && remaining > 0; ++s) {
@@ -320,7 +388,7 @@ long Fat12::freeBytes() const {
 bool Fat12::readByteAt(long off, uint8_t& out) const {
     long lba = off / 512; int within = (int)(off % 512);
     uint8_t sec[512];
-    if (!disk_ || !disk_->readSector(lba, sec)) return false;
+    if (!sectorBytes(lba, sec)) return false;
     out = sec[within];
     return true;
 }
@@ -328,30 +396,41 @@ bool Fat12::readByteAt(long off, uint8_t& out) const {
 bool Fat12::writeByteAt(long off, uint8_t value) {
     long lba = off / 512; int within = (int)(off % 512);
     uint8_t sec[512];
-    if (!disk_ || !disk_->readSector(lba, sec)) return false;
+    if (!sectorBytes(lba, sec)) return false;
     sec[within] = value;
-    return disk_->writeLogicalSector(lba, sec);
+    return putSector(lba, sec);
 }
 
 void Fat12::setFatEntry(int cluster, int value) {
-    value &= 0xFFF;
+    if (value == 0 && cluster < nextFree_) nextFree_ = cluster;
     for (int f = 0; f < nfat_; ++f) {
         long base = (fatStartSec_ + (long)f * spf_) * 512;
+        if (fat16_) {
+            long o = base + (long)cluster * 2;
+            writeByteAt(o, (uint8_t)(value & 0xFF));
+            writeByteAt(o + 1, (uint8_t)((value >> 8) & 0xFF));
+            continue;
+        }
+        int v12 = value & 0xFFF;
         long o = base + cluster + cluster / 2;
         uint8_t lo, hi;
         if (!readByteAt(o, lo)) continue;
         if (!readByteAt(o + 1, hi)) continue;
         uint16_t v = (uint16_t)(lo | (hi << 8));
-        if (cluster & 1) v = (uint16_t)((v & 0x000F) | (value << 4));
-        else             v = (uint16_t)((v & 0xF000) | value);
+        if (cluster & 1) v = (uint16_t)((v & 0x000F) | (v12 << 4));
+        else             v = (uint16_t)((v & 0xF000) | v12);
         writeByteAt(o, (uint8_t)(v & 0xFF));
         writeByteAt(o + 1, (uint8_t)(v >> 8));
     }
 }
 
 int Fat12::allocCluster() {
-    for (int c = 2; c < totalClusters_ + 2; ++c)
-        if (fatEntry(c) == 0) return c;
+    // Search from the lowest cluster that may be free (setFatEntry lowers the
+    // hint when it frees one), so filling a large FAT16 volume stays linear.
+    if (nextFree_ < 2) nextFree_ = 2;
+    for (int c = nextFree_; c < totalClusters_ + 2; ++c)
+        if (fatEntry(c) == 0) { nextFree_ = c; return c; }
+    nextFree_ = totalClusters_ + 2;
     return -1;
 }
 
@@ -382,7 +461,7 @@ bool Fat12::writeClusterData(int cluster, const uint8_t* src, long len) {
         } else {
             memset(sec, 0, 512);
         }
-        if (!disk_->writeLogicalSector(firstSec + s, sec)) return false;
+        if (!putSector(firstSec + s, sec)) return false;
     }
     return true;
 }
@@ -433,7 +512,7 @@ bool Fat12::writeFile(DirEntry& e, const std::vector<uint8_t>& data, std::string
     while ((int)chain.size() < needClusters) {
         int nc = allocCluster();
         if (nc < 0) { releaseNew(); if (err) *err = "disk full (no free clusters)"; return false; }
-        setFatEntry(nc, 0xFFF); // reserve immediately so the next alloc skips it
+        setFatEntry(nc, eoc_); // reserve immediately so the next alloc skips it
         chain.push_back(nc);
     }
 
@@ -450,7 +529,7 @@ bool Fat12::writeFile(DirEntry& e, const std::vector<uint8_t>& data, std::string
 
     // Relink the FAT: chain[0..need-1] linked, last -> EOF; free the rest.
     for (int i = 0; i < needClusters; ++i) {
-        int next = (i + 1 < needClusters) ? chain[i + 1] : 0xFFF;
+        int next = (i + 1 < needClusters) ? chain[i + 1] : eoc_;
         setFatEntry(chain[i], next);
     }
     for (size_t i = needClusters; i < chain.size(); ++i)
@@ -557,7 +636,7 @@ bool Fat12::undelete(DirEntry& e, char firstChar, std::string* err) {
         }
         for (long i = 0; i < need; ++i) {
             int c = e.startCluster + (int)i;
-            setFatEntry(c, i + 1 < need ? c + 1 : 0xFFF);
+            setFatEntry(c, i + 1 < need ? c + 1 : eoc_);
         }
     }
     writeByteAt(e.entryOffset, nm[0]);
@@ -650,7 +729,7 @@ std::vector<uint8_t> Fat12::extractRawUnnamed() const {
         long firstSec = dataStartSec_ + (long)(cluster - 2) * spc_;
         for (int s = 0; s < spc_; ++s) {
             uint8_t sec[512];
-            if (disk_->readSector(firstSec + s, sec)) out.insert(out.end(), sec, sec + 512);
+            if (sectorBytes(firstSec + s, sec)) out.insert(out.end(), sec, sec + 512);
         }
     }
     return out;
@@ -675,10 +754,10 @@ bool Fat12::writeRawUnnamed(const std::vector<uint8_t>& data, long* written, std
         long firstSec = dataStartSec_ + (long)(cluster - 2) * spc_;
         for (int s = 0; s < spc_ && pos < total; ++s) {
             uint8_t sec[512];
-            if (!disk_->readSector(firstSec + s, sec)) { if (err) *err = "read error"; return false; }
+            if (!sectorBytes(firstSec + s, sec)) { if (err) *err = "read error"; return false; }
             long chunk = total - pos; if (chunk > 512) chunk = 512;
             memcpy(sec, data.data() + pos, (size_t)chunk); // partial tail keeps old bytes
-            if (!disk_->writeLogicalSector(firstSec + s, sec)) { if (err) *err = "write error"; return false; }
+            if (!putSector(firstSec + s, sec)) { if (err) *err = "write error"; return false; }
             pos += chunk;
         }
     }
@@ -812,7 +891,7 @@ long Fat12::freeDirSlot(int dirCluster, bool allowGrow) {
     if (nc < 0) return -1;
     std::vector<uint8_t> zero((size_t)spc_ * 512, 0);
     if (!writeClusterData(nc, zero.data(), (long)zero.size())) return -1;
-    setFatEntry(nc, 0xFFF);
+    setFatEntry(nc, eoc_);
     setFatEntry(chain.back(), nc);
     return clusterByteOffset(nc);
 }
@@ -906,11 +985,11 @@ bool Fat12::makeDir(const std::string& parentPath, const std::string& name, std:
     if (slot < 0) { if (err) *err = "parent directory is full"; return false; }
     int nc = allocCluster();
     if (nc < 0) { if (err) *err = "disk full"; return false; }
-    setFatEntry(nc, 0xFFF);
+    setFatEntry(nc, eoc_);
     // Zero the new directory cluster, then write . and .. entries.
     long firstSec = dataStartSec_ + (long)(nc - 2) * spc_;
     uint8_t zero[512]; memset(zero, 0, sizeof zero);
-    for (int s = 0; s < spc_; ++s) disk_->writeLogicalSector(firstSec + s, zero);
+    for (int s = 0; s < spc_; ++s) putSector(firstSec + s, zero);
     uint8_t dot[11], dotdot[11]; pack83(".", dot); pack83("..", dotdot);
     writeDirEntry(firstSec * 512 + 0,  dot,    0x10, (uint16_t)nc, 0);
     writeDirEntry(firstSec * 512 + 32, dotdot, 0x10, (uint16_t)parent, 0);
@@ -940,17 +1019,17 @@ Fat12::FsCheck Fat12::verify() const {
             int c = e.startCluster, guard = 0;
             long chainLen = 0;
             bool broken = false;
-            if (c == 1 || (c >= 2 && c - 2 >= totalClusters_ && c < 0xFF8)) {
+            if (c == 1 || (c >= 2 && c - 2 >= totalClusters_ && c < eocMin_)) {
                 r.issues.push_back(path + ": start cluster out of range"); broken = true;
             }
-            while (!broken && c >= 2 && c < 0xFF8 && guard++ < totalClusters_ + 4) {
+            while (!broken && c >= 2 && c < eocMin_ && guard++ < totalClusters_ + 4) {
                 int idx = c - 2;
                 if (idx >= (int)owner.size()) { r.issues.push_back(path + ": cluster out of range"); broken = true; break; }
                 if (owner[idx] >= 0) { r.issues.push_back(path + ": cross-linked at cluster " + std::to_string(c)); broken = true; break; }
                 owner[idx] = 1; r.usedByFiles++; chainLen++;
                 int nxt = fatEntry(c);
                 if (nxt == 0) { r.issues.push_back(path + ": chain hits a free cluster"); broken = true; break; }
-                if (nxt == 1 || (nxt >= 0xFF0 && nxt <= 0xFF7)) {
+                if (nxt == 1 || nxt == bad_ || (nxt >= totalClusters_ + 2 && nxt < eocMin_)) {
                     r.issues.push_back(path + ": chain hits a reserved/bad cluster marker"); broken = true; break;
                 }
                 c = nxt;
@@ -970,7 +1049,7 @@ Fat12::FsCheck Fat12::verify() const {
         int idx = c - 2;
         int v = fatEntry(c);
         if (v == 0) r.freeClusters++;
-        else if (v == 0xFF7) continue; // marked bad: neither free nor lost
+        else if (v == bad_) continue; // marked bad: neither free nor lost
         else if (idx >= 0 && idx < (int)owner.size() && owner[idx] < 0) r.unreferenced++;
     }
     return r;

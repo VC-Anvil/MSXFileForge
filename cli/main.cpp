@@ -13,6 +13,7 @@
 #include "../core/cas.h"
 #include "../core/util.h"
 #include "../core/tape.h"
+#include "../core/partition.h"
 #include "hostfs.h"
 #include <algorithm>
 #include <cstdio>
@@ -42,10 +43,38 @@ static std::vector<uint8_t> slurp(const char* path) {
     return v;
 }
 
+// --part N (global option): which partition of a hard disk image to use.
+static int g_part = 0;
+
+// Mount the filesystem of an image: a floppy / superfloppy directly, a
+// partitioned disk through partition g_part (default: the first FAT one).
+static bool mountVolume(DiskImage& dk, Fat12& fs, std::string& err) {
+    auto parts = findPartitions(dk);
+    if (parts.empty()) {
+        if (g_part > 1) { err = "image has no partition table"; return false; }
+        return fs.mount(dk, &err);
+    }
+    const Partition* p = nullptr;
+    if (g_part > 0) {
+        for (auto& x : parts) if (x.number == g_part) p = &x;
+        if (!p) { err = "no partition " + std::to_string(g_part) + " (the image has " +
+                        std::to_string(parts.size()) + ")"; return false; }
+    } else {
+        for (auto& x : parts) if (x.fat()) { p = &x; break; }
+        if (!p) { err = "no FAT partition on this disk"; return false; }
+    }
+    if (fs.mount(dk, p->firstSector, p->sectorCount, &err)) return true;
+    // A table that is really junk in a floppy's boot sector: try the image as a
+    // plain volume before giving up (only when no partition was asked for).
+    std::string plain;
+    if (g_part == 0 && fs.mount(dk, &plain)) return true;
+    return false;
+}
+
 static int mountDisk(const char* path, DiskImage& dk, Fat12& fs) {
     std::string err;
     if (!dk.load(path, &err)) { fprintf(stderr, "load error: %s\n", err.c_str()); return 2; }
-    if (!fs.mount(dk, &err)) { fprintf(stderr, "mount error: %s\n", err.c_str()); return 3; }
+    if (!mountVolume(dk, fs, err)) { fprintf(stderr, "mount error: %s\n", err.c_str()); return 3; }
     return 0;
 }
 
@@ -64,9 +93,18 @@ static int cmd_info(const char* img) {
     printf("Geometry   : %d cyl x %d head x %d spt (%ld logical sectors)\n",
            dk.cylinders(), dk.heads(), dk.sectorsPerTrack(), dk.logicalSectors());
     printf("Protected  : %s\n", dk.isProtected() ? "YES" : "no");
+    auto parts = findPartitions(dk);
+    if (!parts.empty()) {
+        printf("Partitions : %zu (use --part N; default = first FAT partition)\n", parts.size());
+        for (auto& p : parts)
+            printf("  %d  %-8s %-15s start=%-9ld %8ld sectors (%ld MB)\n", p.number,
+                   p.logical ? "logical" : "primary", partitionTypeName(p.type),
+                   p.firstSector, p.sectorCount, p.sectorCount / 2048);
+    }
     Fat12 fs;
-    if (fs.mount(dk, &err)) {
-        printf("Filesystem : FAT12  OEM='%s'  label='%s'\n",
+    if (mountVolume(dk, fs, err)) {
+        if (!parts.empty()) printf("Volume     : starts at sector %ld\n", fs.volumeStart());
+        printf("Filesystem : FAT%d  OEM='%s'  label='%s'\n", fs.fatBits(),
                fs.oemName().c_str(), fs.volumeLabel().c_str());
         printf("Clusters   : %d x %d bytes  free=%ld bytes\n",
                fs.totalClusters(), fs.sectorsPerCluster()*512, fs.freeBytes());
@@ -272,13 +310,65 @@ static std::string baseName(const std::string& p) {
     return s == std::string::npos ? p : p.substr(s + 1);
 }
 
+// "720" / "360" (KB floppies) or "<N>M" (MB) -> sectors; 0 if invalid.
+static long parseSize(const std::string& t) {
+    if (t == "720") return 1440;
+    if (t == "360") return 720;
+    if (t.size() > 1 && (t.back() == 'M' || t.back() == 'm')) {
+        long mb = atol(t.substr(0, t.size() - 1).c_str());
+        return (mb >= 1 && mb <= 2047) ? mb * 2048 : 0;   // < 2 GB: offsets are 32-bit on Windows
+    }
+    return 0;
+}
+
+static bool writeImage(const char* path, const std::vector<uint8_t>& img) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+    bool ok = fwrite(img.data(), 1, img.size(), f) == img.size();
+    return fclose(f) == 0 && ok;
+}
+
 static int cmd_format(int argc, char** argv) {
-    if (argc < 3) { fprintf(stderr, "need <out.dsk> [360|720]\n"); return 1; }
-    int kb = (argc >= 4) ? atoi(argv[3]) : 720;
-    auto img = formatBlankImage(kb == 360 ? 720 : 1440);
-    FILE* f = fopen(argv[2], "wb"); if (!f) { fprintf(stderr, "cannot write\n"); return 2; }
-    fwrite(img.data(), 1, img.size(), f); fclose(f);
-    printf("formatted blank %dKB image -> %s (%zu bytes)\n", kb, argv[2], img.size());
+    // format <out> [360|720|<N>M] [LABEL]
+    if (argc < 3) { fprintf(stderr, "need <out.dsk> [360|720|<N>M] [LABEL]\n"); return 1; }
+    std::string sz = argc >= 4 ? argv[3] : "720";
+    long secs = parseSize(sz);
+    if (!secs) { fprintf(stderr, "size must be 360, 720 or <N>M (1-2047)\n"); return 1; }
+    std::vector<uint8_t> img = (secs == 1440 || secs == 720) ? formatBlankImage((int)secs)
+                                                              : formatFatVolume(secs, 0, argc >= 5 ? argv[4] : "");
+    if (img.empty()) { fprintf(stderr, "cannot format that size\n"); return 1; }
+    if (argc >= 5 && (secs == 1440 || secs == 720)) {   // floppy label via the filesystem
+        DiskImage dk; Fat12 fs; std::string err;
+        dk.loadBytes(img, argv[2], &err);
+        if (!fs.mount(dk, &err) || !fs.setVolumeLabel(argv[4], &err)) { fprintf(stderr, "label: %s\n", err.c_str()); return 6; }
+        img = dk.raw();
+    }
+    if (!writeImage(argv[2], img)) { fprintf(stderr, "cannot write %s\n", argv[2]); return 2; }
+    printf("formatted %s image -> %s (%zu bytes)\n", sz.c_str(), argv[2], img.size());
+    return 0;
+}
+
+static int cmd_mkhdd(int argc, char** argv) {
+    // mkhdd <out.img> <N>M[,<N>M...]
+    if (argc < 4) { fprintf(stderr, "need <out.img> <N>M[,<N>M...]\n"); return 1; }
+    std::vector<long> sizes;
+    std::string list = argv[3];
+    size_t p = 0;
+    while (p <= list.size()) {
+        size_t c = list.find(',', p);
+        std::string item = list.substr(p, c == std::string::npos ? std::string::npos : c - p);
+        long secs = item.empty() ? 0 : parseSize(item.back() == 'M' || item.back() == 'm' ? item : item + "M");
+        if (!secs || secs == 1440 || secs == 720) { fprintf(stderr, "bad partition size '%s' (use e.g. 32M)\n", item.c_str()); return 1; }
+        sizes.push_back(secs);
+        if (sizes.size() > 255) { fprintf(stderr, "at most 255 partitions\n"); return 1; }
+        if (c == std::string::npos) break;
+        p = c + 1;
+    }
+    std::string err;
+    auto img = buildPartitionedImage(sizes, &err);
+    if (img.empty()) { fprintf(stderr, "mkhdd: %s\n", err.c_str()); return 6; }
+    if (!writeImage(argv[2], img)) { fprintf(stderr, "cannot write %s\n", argv[2]); return 2; }
+    printf("created %s: %zu partition(s), %zu bytes\n", argv[2], sizes.size(), img.size());
     return 0;
 }
 
@@ -496,7 +586,7 @@ static int cmd_crc(int argc, char** argv) {
 static int cmd_fsck(const char* img) {
     DiskImage dk; Fat12 fs; std::string err;
     if (!dk.load(img, &err)) { fprintf(stderr, "%s\n", err.c_str()); return 2; }
-    if (!fs.mount(dk, &err)) { fprintf(stderr, "mount: %s\n", err.c_str()); return 3; }
+    if (!mountVolume(dk, fs, err)) { fprintf(stderr, "mount: %s\n", err.c_str()); return 3; }
     Fat12::FsCheck c = fs.verify();
     printf("used-by-files: %ld clusters   unreferenced(RAW/lost): %ld   free: %ld\n",
            c.usedByFiles, c.unreferenced, c.freeClusters);
@@ -594,10 +684,20 @@ static int cmd_cas(const char* path) {
 }
 
 int main(int argc, char** argv) {
+    // Strip the global --part N option wherever it appears.
+    std::vector<char*> args;
+    for (int i = 0; i < argc; ++i) {
+        if (!strcmp(argv[i], "--part") && i + 1 < argc) { g_part = atoi(argv[++i]); continue; }
+        args.push_back(argv[i]);
+    }
+    argc = (int)args.size();
+    args.push_back(nullptr);
+    argv = args.data();
     if (argc < 3) {
         fprintf(stderr,
             "MSXFileForge CLI\n"
-            "usage: msxforge <cmd> <file> [args]   (FILE may be a path: DIR/NAME.EXT)\n"
+            "usage: msxforge <cmd> <file> [args] [--part N]   (FILE may be a path: DIR/NAME.EXT)\n"
+            "  --part N selects partition N of a hard disk image (default: first FAT one)\n"
             "\n"
             "disk images (.dsk / .dmk):\n"
             "  info    <img>                       geometry, filesystem, free space\n"
@@ -610,7 +710,8 @@ int main(int argc, char** argv) {
             "  del     <img> <FILE|DIR> [outimg]   delete a file or an empty directory\n"
             "  rename  <img> <FILE> <NEWNAME>      rename in place\n"
             "  mkdir   <img> <NAME> [/PARENT]      create a directory\n"
-            "  format  <out.dsk> [360|720]         blank MSX-DOS disk\n"
+            "  format  <out> [360|720|<N>M] [LABEL] blank floppy, or a FAT16 superfloppy\n"
+            "  mkhdd   <out.img> <N>M[,<N>M...]    partitioned hard disk / SD image\n"
             "  pack    <hostdir> <out.dsk> [360|720] [--label L]  build a disk from a folder\n"
             "  unpack  <img> <hostdir>             extract the whole tree to a folder\n"
             "  undelete <img> <[DIR/]?NAME> [LETTER] [outimg]  recover a deleted file\n"
@@ -646,6 +747,7 @@ int main(int argc, char** argv) {
     if (cmd == "carve")   return cmd_carve(argc, argv);
     if (cmd == "rawput")  return cmd_rawput(argc, argv);
     if (cmd == "format")  return cmd_format(argc, argv);
+    if (cmd == "mkhdd")   return cmd_mkhdd(argc, argv);
     if (cmd == "add")     return cmd_add(argc, argv);
     if (cmd == "rename")  return cmd_rename(argc, argv);
     if (cmd == "mkdir")   return cmd_mkdir(argc, argv);

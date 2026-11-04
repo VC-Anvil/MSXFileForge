@@ -36,6 +36,7 @@
 
 #include "../core/disk_image.h"
 #include "../core/fat12.h"
+#include "../core/partition.h"
 #include "../core/msxfile.h"
 #include "../core/rom.h"
 #include "../core/cas.h"
@@ -59,6 +60,8 @@ struct App {
     DiskImage disk;
     Fat12 fs;
     bool fsMounted = false;
+    std::vector<Partition> parts;     // hard disk images: MBR partitions
+    int partIdx = 0;
     std::vector<DirEntry> listing;
     std::string cwd = "/";
     bool showDeleted = false;
@@ -205,6 +208,17 @@ static void selectFile(App& a, int idx) {
     if (a.selType == MsxFileType::BloadBinary) a.bload = parseBloadHeader(a.selData);
 }
 
+// Mount the filesystem: the image itself, or the selected partition.
+static bool mountCurrent(App& a, std::string& err) {
+    if (a.parts.empty()) return a.fs.mount(a.disk, &err);
+    if (a.partIdx < 0 || a.partIdx >= (int)a.parts.size()) a.partIdx = 0;
+    const Partition& p = a.parts[(size_t)a.partIdx];
+    if (a.fs.mount(a.disk, p.firstSector, p.sectorCount, &err)) return true;
+    std::string plain;   // junk "table" in a floppy boot sector: read the image as one volume
+    if (a.fs.mount(a.disk, &plain)) { a.parts.clear(); err.clear(); return true; }
+    return false;
+}
+
 static void openPath(App& a, const std::string& path) {
     a.imagePath = path; a.mode = Mode::None; a.fsMounted = false;
     a.listing.clear(); a.cas.clear(); a.blob.clear(); a.cwd = "/";
@@ -241,11 +255,15 @@ static void openPath(App& a, const std::string& path) {
     std::string err;
     if (!a.disk.load(path, &err)) { a.status = "Load error: " + err; return; }
     a.mode = Mode::Disk;
-    a.fsMounted = a.fs.mount(a.disk, &err);
+    a.parts = findPartitions(a.disk);
+    a.partIdx = 0;
+    for (size_t i = 0; i < a.parts.size(); ++i) if (a.parts[i].fat()) { a.partIdx = (int)i; break; }
+    a.fsMounted = mountCurrent(a, err);
     if (a.fsMounted) refreshListing(a); else a.listing.clear();
     a.status = std::string("Loaded ") + to_string(a.disk.format()) +
                (a.disk.isProtected() ? "  [PROTECTED]" : "") +
-               (a.fsMounted ? "  |  FAT12 OK" : ("  |  no FS: " + err));
+               (a.parts.empty() ? "" : "  |  " + std::to_string(a.parts.size()) + " partition(s)") +
+               (a.fsMounted ? "  |  FAT" + std::to_string(a.fs.fatBits()) + " OK" : ("  |  no FS: " + err));
 }
 
 // Write the current file's edited bytes back into the image (in memory).
@@ -629,7 +647,7 @@ static void drawRawMap(App& a) {
                            : map[idx] == Fat12::CL_RAW ? "RAW (unnamed)" : "free";
             ImGui::BeginTooltip();
             ImGui::Text("cluster %d  (%s)", idx + 2, st);
-            ImGui::Text("image offset 0x%06lX", a.fs.clusterByteOffset(idx + 2));
+            ImGui::Text("image offset 0x%06lX", a.fs.volumeStart() * 512 + a.fs.clusterByteOffset(idx + 2));
             ImGui::EndTooltip();
         }
     }
@@ -642,8 +660,31 @@ static void drawFileTree(App& a) {
          "Their data may still be recoverable if the clusters were not reused.");
     ImGui::SameLine();
     if (ImGui::Button("Refresh")) refreshListing(a);
+    if (!a.parts.empty()) {
+        auto label = [](const Partition& p) {
+            char buf[96];
+            snprintf(buf, sizeof buf, "%d: %s, %ld MB%s", p.number, partitionTypeName(p.type),
+                     p.sectorCount / 2048, p.logical ? " (logical)" : "");
+            return std::string(buf);
+        };
+        ImGui::SetNextItemWidth(220);
+        if (ImGui::BeginCombo("Partition", label(a.parts[(size_t)a.partIdx]).c_str())) {
+            for (int i = 0; i < (int)a.parts.size(); ++i) {
+                if (ImGui::Selectable(label(a.parts[(size_t)i]).c_str(), i == a.partIdx) && i != a.partIdx) {
+                    a.partIdx = i; a.cwd = "/"; clearSelection(a);
+                    std::string err;
+                    a.fsMounted = mountCurrent(a, err);
+                    if (a.fsMounted) { refreshListing(a); a.status = "Partition " + std::to_string(a.parts[(size_t)i].number) + ": FAT" + std::to_string(a.fs.fatBits()); }
+                    else { a.listing.clear(); a.status = "Partition " + std::to_string(a.parts[(size_t)i].number) + ": no FS: " + err; }
+                }
+            }
+            ImGui::EndCombo();
+        }
+        help("This is a hard disk / SD card image with a partition table (MSX-DOS 2 / Nextor). "
+             "Each partition is a separate drive.");
+    }
     ImGui::Separator();
-    if (!a.fsMounted) { ImGui::TextDisabled("No FAT12 filesystem on this image."); return; }
+    if (!a.fsMounted) { ImGui::TextDisabled("No FAT filesystem on this image / partition."); return; }
 
     // Directory edit toolbar.
     if (ImGui::Button("Add file...")) {
@@ -1226,11 +1267,16 @@ int main(int argc, char** argv) {
             // Info strip
             ImGui::TextDisabled("Format:"); ImGui::SameLine();
             ImGui::TextColored(kAccent, "%s", to_string(app.disk.format()));
-            ImGui::SameLine(); ImGui::TextDisabled("| Geometry:"); ImGui::SameLine();
-            ImGui::Text("%dc x %dh x %ds", app.disk.cylinders(), app.disk.heads(), app.disk.sectorsPerTrack());
+            if (app.disk.format() == DiskFormat::HDD) {   // CHS means nothing here: show the size
+                ImGui::SameLine(); ImGui::TextDisabled("| Size:"); ImGui::SameLine();
+                ImGui::Text("%ld MB (%ld sectors)", app.disk.logicalSectors() / 2048, app.disk.logicalSectors());
+            } else {
+                ImGui::SameLine(); ImGui::TextDisabled("| Geometry:"); ImGui::SameLine();
+                ImGui::Text("%dc x %dh x %ds", app.disk.cylinders(), app.disk.heads(), app.disk.sectorsPerTrack());
+            }
             if (app.disk.isProtected()) { ImGui::SameLine(); ImGui::TextColored(kWarn, "| PROTECTED"); }
             if (app.fsMounted) {
-                ImGui::SameLine(); ImGui::TextDisabled("| FAT12:"); ImGui::SameLine();
+                ImGui::SameLine(); ImGui::TextDisabled(app.fs.fatBits() == 16 ? "| FAT16:" : "| FAT12:"); ImGui::SameLine();
                 ImGui::Text("OEM '%s'  free %ld KB", app.fs.oemName().c_str(), app.fs.freeBytes()/1024);
             }
             ImGui::Separator();
