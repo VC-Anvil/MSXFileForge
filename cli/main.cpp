@@ -388,8 +388,9 @@ static int cmd_add(int argc, char** argv) {
     std::string err;
     if (!fs.createFile(dir, name, data, &err)) { fprintf(stderr, "add: %s\n", err.c_str()); return 6; }
     if (!dk.save(argv[2], &err)) { fprintf(stderr, "save: %s\n", err.c_str()); return 7; }
-    printf("added %s (%zu bytes) as %s%s\n", argv[3], data.size(),
-           dir.c_str(), name.c_str());
+    std::string where = dir;
+    if (where.empty() || (where.back() != '/' && where.back() != '\\')) where += "/";
+    printf("added %s (%zu bytes) as %s%s\n", argv[3], data.size(), where.c_str(), name.c_str());
     return 0;
 }
 

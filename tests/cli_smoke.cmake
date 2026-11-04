@@ -31,6 +31,7 @@ expect_in("10 PRINT \"HELLO\"")
 run(0 "${MSXFORGE}" add "${IMG}" "${WORK}/HELLO.BAS")
 run(0 "${MSXFORGE}" mkdir "${IMG}" DOCS)
 run(0 "${MSXFORGE}" add "${IMG}" "${WORK}/notes.txt" /DOCS README.TXT)
+expect_in("as /DOCS/README.TXT")
 run(6 "${MSXFORGE}" add "${IMG}" "${WORK}/notes.txt" / WAYTOOLONGNAME.TXT)
 file(WRITE "${WORK}/A Long Host Name.txt" "x\n")
 run(0 "${MSXFORGE}" add "${IMG}" "${WORK}/A Long Host Name.txt")   # name derived
